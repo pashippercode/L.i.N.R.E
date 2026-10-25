@@ -192,7 +192,7 @@ if (-not (Test-Path -LiteralPath $GuiReleaseDir -PathType Container)) {
   Fail @"
 找不到界面产物目录：$GuiReleaseDir
 
-这一格要的是 `flutter build windows --release` 的输出：
+这一格要的是 flutter build windows --release 的输出：
     cd gui
     flutter build windows --release
 它需要 MSVC（本机没有就交给 GitHub Actions 的 windows-latest，见 .github/workflows/windows-package.yml）。

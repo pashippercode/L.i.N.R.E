@@ -287,14 +287,17 @@ jobs:
           NOTES_URL: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.publish) && format('https://github.com/{0}/releases/tag/v{1}', github.repository, steps.version.outputs.version) || '' }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $assembleArgs = @(
-            '-Version', '${{ steps.version.outputs.version }}'
-            '-OutDir', 'out'
-            '-NodeDir', '${{ steps.node_runtime.outputs.node_dir }}'
-            '-CrtDir', '${{ steps.gui.outputs.crt_dir }}'
-          )
-          if ($env:ASSET_URL -ne '') { $assembleArgs += @('-ManifestAssetUrl', $env:ASSET_URL) }
-          if ($env:NOTES_URL -ne '') { $assembleArgs += @('-NotesUrl', $env:NOTES_URL) }
+          # **必须用哈希表 splat**：数组 splat（@('-Version','x',...)）传的是*位置*参数，
+          # '-Version' 自己会变成第一个位置参数的值，版号顶到 -RepoRoot 上——
+          # 2026-10-25 首次实跑就是这么红的：「仓库根不存在：0.1.0-beta.12」。
+          $assembleArgs = @{
+            Version = '${{ steps.version.outputs.version }}'
+            OutDir  = 'out'
+            NodeDir = '${{ steps.node_runtime.outputs.node_dir }}'
+            CrtDir  = '${{ steps.gui.outputs.crt_dir }}'
+          }
+          if ($env:ASSET_URL -ne '') { $assembleArgs['ManifestAssetUrl'] = $env:ASSET_URL }
+          if ($env:NOTES_URL -ne '') { $assembleArgs['NotesUrl'] = $env:NOTES_URL }
           & ./packaging/assemble-package.ps1 @assembleArgs
           if ($LASTEXITCODE -ne 0) { throw "装配脚本退出码 $LASTEXITCODE" }
 
