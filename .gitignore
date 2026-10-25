@@ -6,6 +6,9 @@ data/
 workspace/
 .bench-tmp/
 *.log
+# 出包装配的产物（packaging/assemble-package.ps1 的 -OutDir 默认落这里）：
+# 里面是一整份能直接发给别人的便携包，几十 MB，绝不入库。
+out/
 # 本机配置：含 owner 名、联系人表与机器路径，只进版本库之外的 config.json；
 # 仓库里给的是 config.example.json。密钥另在 data/.keys.json（data/ 已忽略）。
 config.json

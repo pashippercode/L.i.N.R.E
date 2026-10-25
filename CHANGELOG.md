@@ -7,6 +7,30 @@
 
 ---
 
+## Unreleased
+
+### 出包交给 GitHub Actions（MSVC）
+
+- Windows 便携包改在 GitHub Actions 的 `windows-latest` 上出：界面是 Flutter Windows 工程，
+  `flutter build windows --release` 必须有 MSVC 与 Windows SDK，出包机上不再需要备这套工具链。
+- 打 tag（`v<版号>`）即出包并建 Release，挂上 `irmia-agent-v<版号>-win-x64.zip`、它的 sha256
+  与 `latest.json`；tag 与 `src/version.ts` 的版号不一致时流水线当场失败，不会产出挂错 tag 的包。
+- 包里自带 node 运行时（与编译后端用的是同一版），对方机器装没装 node 都不影响；官方的
+  node 压缩包在装配前按上游 `SHASUMS256.txt` 核过校验和。
+- 装配清单回到仓库里（`packaging/assemble-package.ps1`）：包根该有哪几个文件只在一处列，
+  装完逐个自检，缺一个就拒绝出包——`restart.ps1` 那类"包里少了脚本、装出来才发现重启不了"
+  的缺陷，现在在出包那一刻就拦得住。
+- 本机仍可干跑装配（拿现成的 `dist\` 与界面产物），不需要 MSVC。
+
+### 本地插件平台与故障自动隔离
+
+- 扩展页新增本地插件管理：安装、按整包 hash 审核信任、启停与版本状态；P0 支持 Skill、Hook、MCP 三类贡献，人工启停明确为重启后生效。
+- 插件包使用内容寻址不可变存储并校验路径、大小与篡改；不写回 `config.json`，MCP 配置热更不会丢失插件声明。
+- 同一贡献连续 3 次系统性故障会隔离整包，30 秒至 15 分钟指数冷却后单路半开恢复；界面展示原因、贡献项、次数和探测状态。业务错误、拒绝、过载与取消不计入。
+- Hook 与 MCP 仍是受信任代码；进程隔离不等于安全沙箱。
+
+---
+
 ## 0.1.0-beta.6 — 2026-10-08
 
 ### 私聊不再被当成群聊分流

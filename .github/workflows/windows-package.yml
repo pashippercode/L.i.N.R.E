@@ -1,0 +1,351 @@
+# ============================================================================
+#  Windows x64 便携包 —— MSVC 上出包（本机缺的那一环）
+#
+#  ## 为什么这件事必须在 GitHub Actions 上做
+#
+#  界面是 Flutter Windows（`gui\windows\runner`，CMake/C++ 工程），`flutter build
+#  windows --release` 必须有 MSVC 工具链 + Windows SDK。打包机上没有这套工具链
+#  （只有 MinGW），所以本机最多能装到"后端 dist + 已编好的 gui 目录"，编不出来。
+#  `windows-latest` 自带 VS2022 的 C++ 工作负载与 SDK ⇒ 那里才是出包的地方。
+#
+#  ## 这份工作流产出的东西
+#
+#      out/irmia-agent-v<版号>-win-x64.zip     ← 解压即用的便携包（目录结构见 packaging/assemble-package.ps1）
+#      out/irmia-agent-v<版号>-win-x64.zip.sha256
+#      out/latest.json                         ← 站点更新清单（形状对齐 src/update/check.ts）
+#
+#  ## 两种触发
+#
+#    · 打 tag 推送（`git push origin v0.1.0-beta.12`）⇒ 出包 + 建 GitHub Release 并挂上三个文件；
+#    · 手工触发（Actions 页面 Run workflow）⇒ 只出包并上传成 artifact，不动 Release
+#      （要发 Release 就把 `publish` 打开）。
+# ============================================================================
+
+name: Windows 便携包（MSVC）
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '产物版号（留空 = 读 src/version.ts 的 AGENT_VERSION）'
+        required: false
+        default: ''
+      publish:
+        description: '跑完顺手建 GitHub Release（手工触发时才有意义）'
+        required: false
+        type: boolean
+        default: false
+      skip_tests:
+        description: '跳过后端测试（出包前的质量闸门；只有急着出包时才勾）'
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+# 同一时间只跑一份：两个 job 抢着装进同一个 Release 只会互相覆盖
+concurrency:
+  group: windows-package-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # 包里自带的 node.exe 与编译 dist 用的 node **必须是同一版**：
+  # 用户机器上跑的就是这个运行时，编出来验的是另一个版本等于没验。
+  NODE_VERSION: '22.19.0'
+  # Flutter 用 stable 通道（pubspec 的 environment.sdk 约束 ^3.9.2 会自动挡掉过旧的版本）。
+  # 要可复现就把这里换成具体版号（如 '3.35.1'），代价是得定期手动升。
+  FLUTTER_CHANNEL: 'stable'
+  # **必须显式指回官方源**：`gui/pubspec.lock` 里每个包都钉着 `url: https://pub.flutter-io.cn`
+  # （国内镜像，开发机用它更快）。托管机在境外，照 lock 去拉这个镜像既慢又不保证可达；
+  # 指回 pub.dev 之后 pub 会按新 host 重新解析一次（CI 工作区里写，不影响仓库）。
+  PUB_HOSTED_URL: 'https://pub.dev'
+  FLUTTER_STORAGE_BASE_URL: 'https://storage.googleapis.com'
+
+jobs:
+  package:
+    name: 装配便携包
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # 打 tag 时要建 Release
+
+    steps:
+      - name: 取仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 装 Node（与包里自带的那个同版）
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: 装依赖
+        run: npm ci
+
+      - name: 编译后端（tsc）
+        run: npm run build
+
+      - name: 跑后端测试（出包前的质量闸门）
+        if: ${{ inputs.skip_tests != true }}
+        run: npm test
+
+      # ── 版号：读源码里的唯一真相源，tag 触发的还要跟 tag 对一次 ──────────────
+      # 版号写死在四处（package.json / src/version.ts / gui 的 settings_page.dart /
+      # gui/pubspec.yaml），这里不替它们"自动同步"——CI 只读、不回写仓库。
+      # 但它必须**说出来**对不对得上，否则出出来的包叫什么名字全靠运气。
+      - name: 解析版号
+        id: version
+        shell: pwsh
+        env:
+          # 手工输入走环境变量，不拼进脚本正文：那是用户可控文本，
+          # 直接内插进 pwsh 脚本等于给了改脚本结构的机会
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 别写 $input / $args：那是自动变量，赋值会踩到语义坑
+          $inputVersion = $env:INPUT_VERSION
+          if ($null -eq $inputVersion) { $inputVersion = '' }
+          $inputVersion = $inputVersion.Trim()
+
+          if ($inputVersion -ne '') {
+            $version = $inputVersion
+            Write-Host "版号来自手工输入：$version"
+          } else {
+            # 版号的读取点按"谁先有算谁"排：`src/version.ts` 是现行唯一真相源，
+            # 但它在仓库历史上曾经写在 `src/main.ts` 里——两者都试，是为了让这条流水线
+            # 在"版号刚搬家"的那一版上也能跑（否则检出后读不到就直接失败）。
+            $candidates = @(
+              @{ Path = 'src/version.ts'; Pattern = "AGENT_VERSION\s*=\s*'([0-9A-Za-z.\-+]+)'" }
+              @{ Path = 'src/main.ts';    Pattern = "AGENT_VERSION\s*=\s*'([0-9A-Za-z.\-+]+)'" }
+            )
+            $version = ''
+            foreach ($candidate in $candidates) {
+              if (-not (Test-Path -LiteralPath $candidate.Path)) { continue }
+              $text = Get-Content -LiteralPath $candidate.Path -Raw -Encoding UTF8
+              $m = [regex]::Match($text, $candidate.Pattern)
+              if ($m.Success) { $version = $m.Groups[1].Value; Write-Host "版号来自 $($candidate.Path)：$version"; break }
+            }
+            if ($version -eq '') {
+              $pkgVersion = (Get-Content -LiteralPath 'package.json' -Raw -Encoding UTF8 | ConvertFrom-Json).version
+              if ($pkgVersion) { $version = $pkgVersion; Write-Host "版号回退到 package.json：$version" }
+            }
+            if ($version -eq '') { throw '读不到版号：src/version.ts、src/main.ts、package.json 都没有可用版号' }
+          }
+
+          # 形状与装配器一致（装配器那边也允许 `+build` 这种构建元数据）
+          if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
+            throw "版号形状不对：'$version'（要 x.y.z 或 x.y.z-预发布）"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+          # 版本口径核对：**只警告不失败**。四处各自有分工（pubspec 只吃 x.y.z+build，
+          # 预发布标记在界面常量里），严格相等本来就不成立；这里要的是"漂了能看见"。
+          $base = ($version -split '[-+]')[0]
+          $pkg = (Get-Content -LiteralPath 'package.json' -Raw -Encoding UTF8 | ConvertFrom-Json).version
+          $pubspecHit = Select-String -LiteralPath 'gui/pubspec.yaml' -Pattern '^version:\s*(\S+)' | Select-Object -First 1
+          $pubspec = if ($pubspecHit) { $pubspecHit.Matches[0].Groups[1].Value } else { '(读不到)' }
+          $guiHit = Select-String -LiteralPath 'gui/lib/pages/settings_page.dart' -Pattern "guiVersion\s*=\s*'([^']+)'" | Select-Object -First 1
+          $gui = if ($guiHit) { $guiHit.Matches[0].Groups[1].Value } else { '(读不到)' }
+          Write-Host "口径：version=$version · package.json=$pkg · pubspec=$pubspec · guiVersion=$gui"
+          if ($pkg -notlike "$base*") { Write-Host "::warning::package.json 的 version（$pkg）与产品版号（$version）不在同一条线上" }
+          if ($pubspec -notlike "$base*") { Write-Host "::warning::gui/pubspec.yaml 的 version（$pubspec）与产品版号（$version）不在同一条线上" }
+          if ($gui -ne "v$version" -and $gui -ne $version) { Write-Host "::warning::settings_page.dart 的 guiVersion（$gui）与产品版号（v$version）不一致（界面会显示旧版号）" }
+
+      - name: 核对 tag 与版号
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ github.ref_name }}'
+          $want = 'v${{ steps.version.outputs.version }}'
+          if ($tag -ne $want) {
+            throw "tag 是 $tag，但源码里的版号是 $want —— 出出来的包会挂在与自己版号不符的 tag 上。先把 src/version.ts 对齐再打 tag。"
+          }
+          Write-Host "tag 与版号一致：$tag"
+
+      # ── Flutter / MSVC ────────────────────────────────────────────────────
+      - name: 装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: 记录工具链版本（出问题要能对上号）
+        shell: pwsh
+        run: |
+          flutter --version
+          # Flutter 的 Windows 构建靠 symlink 装插件；没有开发者模式就直接报
+          # "Building with plugins requires symlink support"。
+          # runner 是管理员账户，把这一格打开即可（等价于设置里的开发者模式）。
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock" /t REG_DWORD /f /v AllowDevelopmentWithoutDevLicense /d 1
+          if ($LASTEXITCODE -ne 0) { throw '开开发者模式失败（flutter windows 构建需要 symlink 支持）' }
+
+      - name: 取依赖
+        working-directory: gui
+        run: flutter pub get
+
+      - name: 编译界面（flutter build windows --release）
+        working-directory: gui
+        # 不传 --build-name/--build-number：exe 的资源版号按 gui/pubspec.yaml 的
+        # `x.y.z+build` 来，那是这个仓库定下的口径（见 pubspec 顶部那段注释），
+        # 预发布标记（-beta.N）本来就不进 exe 版本资源。
+        run: flutter build windows --release
+
+      - name: 确认界面产物并定位 VC++ 运行库
+        id: gui
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = 'gui/build/windows/x64/runner/Release'
+          # 这三样少任何一样，装到别人机器上就是"双击没反应"（exe 在也没用）
+          foreach ($rel in @('irmia_gui.exe', 'flutter_windows.dll', 'data\icudtl.dat')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $release $rel))) { throw "flutter 说成功了，但产物里缺 $rel" }
+          }
+          Get-ChildItem -LiteralPath $release | Select-Object Name, Length | Format-Table -AutoSize
+
+          # VC++ 运行库：flutter 的 windows install 规则**一条都不拷**，我们补上
+          # （装配器的 §3b 会把这里找到的 dll 放进 gui\，见 packaging/assemble-package.ps1）
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw 'vswhere 不存在：托管机上没有 Visual Studio？' }
+          $crt = ''
+          foreach ($install in @(& $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)) {
+            if ([string]::IsNullOrWhiteSpace($install)) { continue }
+            $redistRoot = Join-Path $install.Trim() 'VC\Redist\MSVC'
+            if (-not (Test-Path -LiteralPath $redistRoot -PathType Container)) { continue }
+            foreach ($versionDir in (@(Get-ChildItem -LiteralPath $redistRoot -Directory | Sort-Object Name -Descending))) {
+              $candidate = Join-Path $versionDir.FullName 'x64\Microsoft.VC143.CRT'
+              if (Test-Path -LiteralPath $candidate -PathType Container) { $crt = $candidate; break }
+            }
+            if ($crt -ne '') { break }
+          }
+          if ($crt -eq '') { throw '找不到 Microsoft.VC143.CRT：不带上它，界面在没有 VC++ 运行库的机器上打不开' }
+          Write-Host "VC++ 运行库：$crt"
+          "crt_dir=$crt" >> $env:GITHUB_OUTPUT
+
+      # ── 自带 node 运行时：官方压缩包 + 校验和核对 ──────────────────────────
+      - name: 取自带 node 运行时
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:NODE_VERSION
+          $zipName = "node-v$version-win-x64.zip"
+          $base = "https://nodejs.org/dist/v$version"
+          $work = Join-Path $env:RUNNER_TEMP 'node-runtime'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $zip = Join-Path $work $zipName
+
+          Write-Host "下载 $base/$zipName"
+          Invoke-WebRequest -Uri "$base/$zipName" -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5
+
+          # 校验和：从官方 SHASUMS256.txt 里取这一行来对（不裸信一次 HTTP 传输）
+          $shasums = (Invoke-WebRequest -Uri "$base/SHASUMS256.txt" -MaximumRetryCount 3 -RetryIntervalSec 5).Content
+          $line = ($shasums -split "`n" | Where-Object { $_ -match [regex]::Escape($zipName) } | Select-Object -First 1)
+          if (-not $line) { throw "SHASUMS256.txt 里没有 $zipName" }
+          $expected = ($line -split '\s+')[0].Trim().ToLowerInvariant()
+          $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw "node 运行时的 sha256 对不上：期望 $expected，实得 $actual" }
+          Write-Host "sha256 核对通过：$actual"
+
+          Expand-Archive -LiteralPath $zip -DestinationPath $work -Force
+          $dir = Join-Path $work "node-v$version-win-x64"
+          if (-not (Test-Path -LiteralPath (Join-Path $dir 'node.exe'))) { throw "$dir 里没有 node.exe" }
+          & (Join-Path $dir 'node.exe') -v
+          "node_dir=$dir" >> $env:GITHUB_OUTPUT
+        id: node_runtime
+
+      # ── 装配 ──────────────────────────────────────────────────────────────
+      - name: 装配便携包
+        id: assemble
+        shell: pwsh
+        env:
+          # 只有"这次真的会有一个 Release"时才写地址：tag 推送，或手工触发勾了 publish。
+          # 地址里的 tag 用 `v<版号>` 而不是 `github.ref_name`——手工触发时 ref 是分支名，
+          # 而 Release 的 tag 永远是 `v<版号>`（下面那步就是这么建的）。
+          ASSET_URL: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.publish) && format('https://github.com/{0}/releases/download/v{1}/irmia-agent-v{1}-win-x64.zip', github.repository, steps.version.outputs.version) || '' }}
+          NOTES_URL: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.publish) && format('https://github.com/{0}/releases/tag/v{1}', github.repository, steps.version.outputs.version) || '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assembleArgs = @(
+            '-Version', '${{ steps.version.outputs.version }}'
+            '-OutDir', 'out'
+            '-NodeDir', '${{ steps.node_runtime.outputs.node_dir }}'
+            '-CrtDir', '${{ steps.gui.outputs.crt_dir }}'
+          )
+          if ($env:ASSET_URL -ne '') { $assembleArgs += @('-ManifestAssetUrl', $env:ASSET_URL) }
+          if ($env:NOTES_URL -ne '') { $assembleArgs += @('-NotesUrl', $env:NOTES_URL) }
+          & ./packaging/assemble-package.ps1 @assembleArgs
+          if ($LASTEXITCODE -ne 0) { throw "装配脚本退出码 $LASTEXITCODE" }
+
+      # ── 冒烟测试：用**包里自带的** node 去语法检查包里的入口 ────────────────
+      # 它能抓住的两类事：自带运行时没进包、dist 与运行时版本不兼容（编译期由 tsc 保证，
+      # 但"能加载"是运行期的事）。真正的启动链需要模型 key 与 data 目录，不在 CI 里跑。
+      - name: 冒烟测试（自带运行时 × 包内入口）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.version.outputs.version }}'
+          $pkg = Get-ChildItem -LiteralPath 'out/_stage' -Directory | Select-Object -First 1
+          if (-not $pkg) { throw '装配目录不存在' }
+          $node = Join-Path $pkg.FullName 'runtime\node\node.exe'
+          $entry = Join-Path $pkg.FullName 'dist\main.js'
+          Write-Host "自带的 node：$(& $node -v)"
+          & $node --check $entry
+          if ($LASTEXITCODE -ne 0) { throw "包内入口语法检查失败（$entry）" }
+          & $node --check (Join-Path $pkg.FullName 'dist\cli.js')
+          if ($LASTEXITCODE -ne 0) { throw '包内 cli.js 语法检查失败' }
+          Write-Host '冒烟测试通过'
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: irmia-agent-v${{ steps.version.outputs.version }}-win-x64
+          path: |
+            out/*.zip
+            out/*.zip.sha256
+            out/latest.json
+            out/_stage/*/VERSION.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      # ── 发 Release（只在 tag 推送或手工勾了 publish 时） ────────────────────
+      - name: 建 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 显式关掉"原生命令 stderr 当异常"：下面 `gh release view` 在 Release 还不存在时
+          # 是靠退出码判断的，不该因为它往 stderr 写一行就把整步打挂。
+          $PSNativeCommandUseErrorActionPreference = $false
+          $version = '${{ steps.version.outputs.version }}'
+          $tag = "v$version"
+
+          # tag 推送时 tag 已经存在；手工触发时可能还没有，那就顺手建上
+          gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            # 预发布标记（-beta.N）才标 prerelease：稳定版被标成预发布，客户端"最新版"就永远读不到它
+            $createArgs = @('release', 'create', $tag, '--title', "Irmia Agent $version", '--generate-notes')
+            if ($version -match '-') { $createArgs += '--prerelease' }
+            & gh @createArgs
+            if ($LASTEXITCODE -ne 0) { throw "建 Release 失败：$tag" }
+          }
+          # 显式列三个资产：`Get-ChildItem out` 会把 out\ 里任何残留（旧 zip、调试产物）
+          # 一起挂上 Release，成了"发布的就是工作区里随便躺着的东西"
+          $assets = @(
+            (Join-Path 'out' "irmia-agent-v$version-win-x64.zip")
+            (Join-Path 'out' "irmia-agent-v$version-win-x64.zip.sha256")
+            (Join-Path 'out' 'latest.json')
+          )
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) { throw "要发布的资产不在：$asset" }
+          }
+          gh release upload $tag @assets --clobber
+          if ($LASTEXITCODE -ne 0) { throw '上传资产失败' }
+          Write-Host "Release 资产已更新：$tag"
