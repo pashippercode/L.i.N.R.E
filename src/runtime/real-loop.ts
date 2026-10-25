@@ -1520,6 +1520,10 @@ export interface RealLoopDeps {  log: EventLog;
    * 列表即可（就绪情况 real-loop 看不到——`McpClientPool` 归宿主）。
    */
   mcpServers?: () => readonly string[];
+  /** MCP 池与索引共享的声明面；缺省保持只读内置配置 */
+  mcpDeclarations?: () => readonly import('../mcp/client.js').McpServerEntry[];
+  /** 一轮结算后、下一批输入前应用插件隔离/恢复 */
+  onTurnBoundary?: () => Promise<void>;
   /**
    * **配置热更**：`config.json` 里可热更的那些字段变了之后，由宿主调一次（2026-10-10 加）。
    *
@@ -1658,6 +1662,7 @@ export class RealLoop {
    * 而 `busy` 的置位也已提到 prepare 段之前（同一处修的另一半），两者一起才堵住这个缺口。
    */
   private tickInFlight = false;
+  private tickCompletion: Promise<void> | null = null;
   /**
    * 本拍进行期间**被守卫吞掉的拍数**。
    *
@@ -1805,14 +1810,15 @@ export class RealLoop {
    * `tools` 两段常驻前缀，若每轮现问 `SkillManager.catalogText()`，那么**批准装一个技能 /
    * 删一个技能**就会把请求前缀改一次（整段历史掉出 KV 缓存，实测口径 ≈9.6 万 token 一轮）。
    * 用户这一轮的判据是「skill 索引的进入和退出也要有类似 mcp 的进入和退出那样的缓存保护的机制」
-   * ⇒ 字节只来自日志里那条 `skill/index` 快照，而快照只在下面三个点上重建
-   * （`skillIndexSync` 的方法头：首次 / 模板换代 / 压缩之后）。
+   * ⇒ 字节只来自日志里那条 `skill/index` 快照，而快照只在下面四个点上重建
+   * （`skillIndexSync` 的方法头：首次 / 模板换代 / 压缩之后 / 插件 Skill 根变化）。
    *
    * 记在实例上还有一个**本轮内不许抖动**的用处：`agentDeps()` 一轮调一次，它读的就是这一格
    * ⇒ 同一轮里哪怕中途批了一个技能，这一轮所有 step 用的仍是**同一个**字节串
    * （下一拍归集才会换，那才是"一轮之内只允许变一次"）。
    */
   private skillIndexText = '';
+  private skillPackageRootsRevision = -1;
 
   /**
    * 信任表折到哪一条了（`skillIndexSync` 的增量折叠用；seq 只增）。
@@ -2583,12 +2589,13 @@ export class RealLoop {
     return this.userSpokeNote;
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     this.running = false;
     this.wakeChannelData = null;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.heartbeatSource.stop();
+    await this.tickCompletion?.catch(() => undefined);
   }
 
   async writeProjectionCache(): Promise<void> {
@@ -2793,6 +2800,11 @@ export class RealLoop {
       // 为什么它非报不可：这条路两个现成刹车都到不了，详见 `notifyReasoningEcho` 的注释。
       if (reason.kind === 'error' && reason.reasoningEcho === true) await this.notifyReasoningEcho(reason);
     } finally {
+      try {
+        await this.deps.onTurnBoundary?.();
+      } catch (error) {
+        this.write(`[插件] turn 边界应用失败：${error instanceof Error ? error.message : String(error)}`);
+      }
       this.busy = false;
     }
   }
@@ -2841,9 +2853,12 @@ export class RealLoop {
     }
     this.tickInFlight = true;
     const startedAt = Date.now();
+    const completion = this.tickOnce();
+    this.tickCompletion = completion;
     try {
-      await this.tickOnce();
+      await completion;
     } finally {
+      if (this.tickCompletion === completion) this.tickCompletion = null;
       // try/finally：`tickOnce` 抛错也一定复位，否则一次异常就把循环永久锁死
       // （外层 `start()` 的 `.catch` 只管报错，不会复位任何标志）。
       this.tickInFlight = false;
@@ -3025,7 +3040,7 @@ export class RealLoop {
       return this.mcpIndexText;
     }
 
-    const view = mcpIndexView(this.deps.config.mcp.servers, this.deps.dataDir);
+    const view = mcpIndexView(this.deps.mcpDeclarations?.() ?? this.deps.config.mcp.servers, this.deps.dataDir);
     // 空索引：不写事件（判据见方法头），但**缓存要跟着置空**——她这一刻确实一个 server 都没有。
     if (view.text === '') {
       this.mcpIndexText = '';
@@ -3076,14 +3091,16 @@ export class RealLoop {
   async skillIndexSync(): Promise<string> {
     const point = skillIndexOf(this.eventView);
     const version = RENDER_VERSION;
-    // 与 `mcpIndexSync` 的 `stale` 逐条同形：首次 / 模板换代 / 压缩之后（那三条的理由写在那处）
+    // 与 `mcpIndexSync` 的 `stale` 同形，另加插件 Skill 根版本：根变化必须在下一拍重建
     const stale = point.seq === 0
       || point.version !== version
-      || point.seq < point.coveredSeq;
+      || point.seq < point.coveredSeq
+      || this.skillPackageRootsRevision !== (this.skills?.packageRevision ?? 0);
     if (!stale) {
       this.skillIndexText = point.text ?? '';
       return this.skillIndexText;
     }
+    this.skillPackageRootsRevision = this.skills?.packageRevision ?? 0;
 
     // 信任门的真相源是日志：重建**之前**把**还没折过**的 `skill/installed` 折进来。
     //
@@ -3168,8 +3185,9 @@ export class RealLoop {
     const fields = change.fields.join('、');
     this.write(`[配置] 热更已并入：${fields}（循环这一侧读的是同一份就地改过的 AppConfig，无需重建）`);
     if (change.fields.includes('mcp.servers')) {
-      const enabled = this.deps.config.mcp.servers.filter(entry => entry.disabled !== true).length;
-      this.write(`[MCP] 声明面已热更（当前 ${this.deps.config.mcp.servers.length} 个 server，`
+      const declarations = this.deps.mcpDeclarations?.() ?? this.deps.config.mcp.servers;
+      const enabled = declarations.filter(entry => entry.disabled !== true).length;
+      this.write(`[MCP] 声明面已热更（当前 ${declarations.length} 个 server，`
         + `${enabled} 个启用）：**常驻索引那一段的字节保持不变**——`
         + '它按既有快照机制在下一次上下文重大变化（压缩 / reset）或重启时归集；'
         + '此刻要她看见的变化走的是尾部追加的那条通报（wake/manual · via=mcp）');

@@ -1291,6 +1291,75 @@ class OverriddenStrings extends AppStrings {
 
   @override
   String get retry => overrides['retry'] ?? base.retry;
+
+  // 插件平台这批文案是后加的，第一版漏了整组 —— 少一条这个类就编不过
+  // （Dart 的非抽象类必须实现全部成员）。按本文件的规矩分开处理：
+  //   · 无参 getter 能被人改 => 先看 overrides 再回 base
+  //   · 带参句子语序由实现决定 => 原样委托给 base
+  @override
+  String get extSectionPlugins => overrides['extSectionPlugins'] ?? base.extSectionPlugins;
+  @override
+  String get extSectionPluginsBlurb => overrides['extSectionPluginsBlurb'] ?? base.extSectionPluginsBlurb;
+  @override
+  String get extPluginInstall => overrides['extPluginInstall'] ?? base.extPluginInstall;
+  @override
+  String get extPluginInstallTitle => overrides['extPluginInstallTitle'] ?? base.extPluginInstallTitle;
+  @override
+  String get extPluginSourceDir => overrides['extPluginSourceDir'] ?? base.extPluginSourceDir;
+  @override
+  String get extPluginSourceHint => overrides['extPluginSourceHint'] ?? base.extPluginSourceHint;
+  @override
+  String get extPluginAbsoluteRequired => overrides['extPluginAbsoluteRequired'] ?? base.extPluginAbsoluteRequired;
+  @override
+  String get extPluginEmpty => overrides['extPluginEmpty'] ?? base.extPluginEmpty;
+  @override
+  String get extPluginEmptyHint => overrides['extPluginEmptyHint'] ?? base.extPluginEmptyHint;
+  @override
+  String extPluginSummary(int count) => base.extPluginSummary(count);
+  @override
+  String extPluginStat(int count) => base.extPluginStat(count);
+  @override
+  String extPluginState(String state) => base.extPluginState(state);
+  @override
+  String get extPluginRestartRequired => overrides['extPluginRestartRequired'] ?? base.extPluginRestartRequired;
+  @override
+  String extPluginContributions(int skills, int hooks, int mcp) => base.extPluginContributions(skills, hooks, mcp);
+  @override
+  String extPluginVersionHash(String version, String hash) => base.extPluginVersionHash(version, hash);
+  @override
+  String get extPluginPermissionsLabel => overrides['extPluginPermissionsLabel'] ?? base.extPluginPermissionsLabel;
+  @override
+  String get extPluginProblemsLabel => overrides['extPluginProblemsLabel'] ?? base.extPluginProblemsLabel;
+  @override
+  String get extPluginReview => overrides['extPluginReview'] ?? base.extPluginReview;
+  @override
+  String extPluginReviewTitle(String id) => base.extPluginReviewTitle(id);
+  @override
+  String extPluginReviewBody(String id, String hash) => base.extPluginReviewBody(id, hash);
+  @override
+  String get extPluginEnable => overrides['extPluginEnable'] ?? base.extPluginEnable;
+  @override
+  String get extPluginDisable => overrides['extPluginDisable'] ?? base.extPluginDisable;
+  @override
+  String extPluginEnableTitle(String id) => base.extPluginEnableTitle(id);
+  @override
+  String extPluginDisableTitle(String id) => base.extPluginDisableTitle(id);
+  @override
+  String get extPluginRestartBody => overrides['extPluginRestartBody'] ?? base.extPluginRestartBody;
+  @override
+  String get extPluginInstalledToast => overrides['extPluginInstalledToast'] ?? base.extPluginInstalledToast;
+  @override
+  String extPluginConfirmedToast(String id) => base.extPluginConfirmedToast(id);
+  @override
+  String extPluginRestartToast(String action, String id) => base.extPluginRestartToast(action, id);
+  @override
+  String extPluginFailed(String reason) => base.extPluginFailed(reason);
+  @override
+  String extPluginCircuit(String contribution, int count) => base.extPluginCircuit(contribution, count);
+  @override
+  String extPluginCircuitReason(String reason) => base.extPluginCircuitReason(reason);
+  @override
+  String extPluginRetryAt(String at) => base.extPluginRetryAt(at);
   @override
   String get cancel => overrides['cancel'] ?? base.cancel;
   @override

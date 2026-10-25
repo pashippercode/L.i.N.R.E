@@ -91,6 +91,8 @@ export interface SkillCandidate {
   rootName: string;
   /** 正文行数（观测用：官方建议 <500 行） */
   bodyLines: number;
+  /** 来自已受信插件包时，信任由整包 hash 提供 */
+  packageHash?: string;
 }
 
 export interface SkillReject {
@@ -410,11 +412,15 @@ export function clipDescription(
 
 // ──────────────────────────────── 管理面 ────────────────────────────────
 
+export interface PluginSkillRoot { dir: string; rootName: string; packageHash: string }
+
 export interface SkillManagerOptions {
   /** 技能根基准目录，默认 process.cwd()（技能是项目级资产，与 workspace/ 同级） */
   baseRoot?: string;
   /** 技能根（相对 baseRoot 的 posix 路径），默认 DEFAULT_SKILL_ROOTS */
   rootNames?: readonly string[];
+  /** 已由宿主验整包信任的额外技能根；优先级低于内置根 */
+  packageRoots?: readonly PluginSkillRoot[];
   /** catalog 单条 token 预算，默认 CATALOG_ENTRY_TOKEN_BUDGET */
   catalogEntryTokens?: number;
   /** catalog 总 token 预算，默认 CATALOG_TOTAL_TOKEN_BUDGET */
@@ -436,6 +442,8 @@ export interface SkillManagerOptions {
 export class SkillManager {
   private readonly baseRoot: string;
   private readonly rootNames: readonly string[];
+  private packageRoots: readonly PluginSkillRoot[];
+  private packageRootsRevision = 1;
   private readonly entryTokens: number;
   private readonly totalTokens: number;
   private readonly out: (line: string) => void;
@@ -448,6 +456,7 @@ export class SkillManager {
   constructor(options: SkillManagerOptions = {}) {
     this.baseRoot = options.baseRoot ?? process.cwd();
     this.rootNames = options.rootNames ?? DEFAULT_SKILL_ROOTS;
+    this.packageRoots = options.packageRoots ?? [];
     this.entryTokens = Math.max(1, Math.trunc(options.catalogEntryTokens ?? CATALOG_ENTRY_TOKEN_BUDGET));
     this.totalTokens = Math.max(0, Math.trunc(options.catalogTotalTokens ?? CATALOG_TOTAL_TOKEN_BUDGET));
     this.out = options.out ?? (() => undefined);
@@ -455,14 +464,22 @@ export class SkillManager {
     this.emit = options.emit ?? null;
   }
 
+  setPackageRoots(roots: readonly PluginSkillRoot[]): void {
+    this.packageRoots = roots;
+    this.packageRootsRevision += 1;
+    this.reported.clear();
+  }
+
+  get packageRevision(): number { return this.packageRootsRevision; }
+
   /** 技能根绝对路径（按优先级） */
   get roots(): string[] {
-    return this.rootNames.map((name) => join(this.baseRoot, name));
+    return [...this.rootNames.map((name) => join(this.baseRoot, name)), ...this.packageRoots.map((root) => root.dir)];
   }
 
   /** 只读区前缀（相对工具白名单根的 posix 路径）：技能目录可读、不可写 */
   get readOnlyPrefixes(): string[] {
-    return [...this.rootNames];
+    return [...this.rootNames, ...this.packageRoots.map((root) => root.rootName)];
   }
 
   /** 去重诊断：同一句话只输出一次，避免每轮 turn 刷屏 */
@@ -478,8 +495,11 @@ export class SkillManager {
     const rejected: SkillReject[] = [];
     const claimed = new Map<string, string>();
 
-    for (const rootName of this.rootNames) {
-      const root = join(this.baseRoot, rootName);
+    const roots = [
+      ...this.rootNames.map((rootName) => ({ rootName, root: join(this.baseRoot, rootName), packageHash: undefined as string | undefined })),
+      ...this.packageRoots.map((item) => ({ rootName: item.rootName, root: item.dir, packageHash: item.packageHash })),
+    ];
+    for (const { rootName, root, packageHash } of roots) {
       let entries: string[];
       try {
         entries = readdirSync(root).slice().sort(); // 目录名升序：扫描结果确定性
@@ -543,6 +563,7 @@ export class SkillManager {
           bytes: Buffer.byteLength(text, 'utf8'),
           rootName,
           bodyLines: parsed.bodyLines,
+          ...(packageHash !== undefined ? { packageHash } : {}),
         });
       }
     }
@@ -626,12 +647,17 @@ export class SkillManager {
     return { state: 'trusted', detail: `已由 human 确认（${entry.ts}）` };
   }
 
+  private trustCandidate(candidate: SkillCandidate): SkillTrustVerdict {
+    if (candidate.packageHash !== undefined) return { state: 'trusted', detail: `由已确认插件包 ${candidate.packageHash} 提供` };
+    return this.trustOf(candidate.name, candidate.contentHash);
+  }
+
   /** 未进 catalog 的技能：给人类确认界面/CLI 用的待办面 */
   pending(candidates?: readonly SkillCandidate[]): SkillPending[] {
     const list = candidates ?? this.scan().candidates;
     const out: SkillPending[] = [];
     for (const candidate of list) {
-      const verdict = this.trustOf(candidate.name, candidate.contentHash);
+      const verdict = this.trustCandidate(candidate);
       if (verdict.state === 'trusted') continue;
       out.push({ name: candidate.name, relDir: candidate.relDir, state: verdict.state, detail: verdict.detail });
     }
@@ -655,7 +681,7 @@ export class SkillManager {
           + '过于模糊会永远不会被想起（description 是唯一触发机制：写清能力 + 触发场景 + 关键词）',
         );
       }
-      const verdict = this.trustOf(candidate.name, candidate.contentHash);
+      const verdict = this.trustCandidate(candidate);
       if (verdict.state !== 'trusted') {
         pending.push({ name: candidate.name, relDir: candidate.relDir, state: verdict.state, detail: verdict.detail });
         continue;
@@ -789,7 +815,7 @@ export class SkillManager {
       lines.push(`[技能] ${item.name}（${item.relDir}）未进 catalog：${item.detail}`);
     }
     for (const item of scan.candidates) {
-      const verdict = this.trustOf(item.name, item.contentHash);
+      const verdict = this.trustCandidate(item);
       if (verdict.state === 'trusted') lines.push(`[技能] ${item.name} 已生效（${item.relDir}）`);
     }
     return lines;

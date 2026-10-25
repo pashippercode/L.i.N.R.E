@@ -655,6 +655,12 @@ export interface McpProcess {
 
 export type McpProcessSpawner = (entry: McpServerEntry) => McpProcess;
 
+export interface McpSystemicFailure {
+  serverName: string;
+  category: 'start' | 'protocol' | 'crash' | 'timeout';
+  message: string;
+}
+
 export interface McpClientPoolOptions {
   servers: readonly McpServerEntry[];
   emit: McpEventEmitter;
@@ -719,6 +725,8 @@ export interface McpClientPoolOptions {
   spawner?: McpProcessSpawner;
   /** 日志出口（stderr、协议错误、注册问题）；默认丢弃，绝不写 stdout */
   onLog?: (line: string) => void;
+  onSystemicFailure?: (failure: McpSystemicFailure) => void;
+  onRequestSuccess?: (serverName: string) => void;
   now?: () => number;
 }
 
@@ -1176,6 +1184,7 @@ export interface McpConnectionHost {
   onListChangedRefresh(conn: McpConnection): void;
   onConnectionExit(conn: McpConnection, code: number | null, signal: string | null): void;
   onProtocolViolation(conn: McpConnection, detail: string): void;
+  onRequestTimeout?(conn: McpConnection, method: string): void;
   gracefulCancel(conn: McpConnection, requestId: number, reason: string): void;
   /**
    * 把刚取回来的清单落盘（可选口子：**探测宿主刻意不接它**）。
@@ -1210,6 +1219,7 @@ export class McpConnection {
   private stopReported = false;
 
   private readyFlag = false;
+  handshakeCompleted = false;
   private toolsCache: McpToolInfo[] = [];
   /** 最近一次 tools/list 的如实小结（页数 / 件数 / 有没有截断）——回执与日志共读这一份 */
   private toolsListSummaryRef: McpToolsListSummary = {
@@ -1575,9 +1585,10 @@ export class McpConnection {
     if (outcome.capabilities['tools'] === undefined) {
       this.host.log(`MCP server ${this.serverName} 未声明 tools 能力：按规范不发 tools/list，该 server 无工具`);
       this.toolsCache = [];
-      return;
+    } else {
+      await this.refreshTools();
     }
-    await this.refreshTools();
+    this.handshakeCompleted = true;
   }
 
   /** 拉一次 `tools/list` 并刷新缓存（启动时一次；list_changed 与重连后再来一次） */
@@ -1813,6 +1824,7 @@ export class McpConnection {
       kind: 'error',
       error: new McpRequestTimeoutError(this.serverName, pending.method, pending.timeoutMs, hardCapHit),
     });
+    this.host.onRequestTimeout?.(this, pending.method);
     // 超时即杀的第一半：先把取消告诉 server（规范要求的通知）
     this.writeNotification('notifications/cancelled', {
       requestId: pending.id,
@@ -1923,6 +1935,7 @@ export class McpClientPool implements McpConnectionHost {
     startMs: number | null; rssMb: number | null; rssSource: McpRssSource; rssProcesses: number | null;
     inFlightPeak: number; lastReclaimedAtMs: number | null; lastStopReason: McpStopReason | null;
   }>();
+  private readonly resourceSamples = new Set<Promise<void>>();
   /** 整池在飞（池级背压的计数器；进出成对，见 `callTool`） */
   private inFlightTotal = 0;
   private readonly registryRef: ToolRegistry | undefined;
@@ -1945,6 +1958,8 @@ export class McpClientPool implements McpConnectionHost {
   private readonly toolTimeoutMs: number;
   private readonly spawnProcess: McpProcessSpawner;
   private readonly logLine: (line: string) => void;
+  private readonly systemicFailure: (failure: McpSystemicFailure) => void;
+  private readonly requestSuccess: (serverName: string) => void;
   private readonly nowFn: () => number;
   private sweeper: ReturnType<typeof setInterval> | null = null;
   private shuttingDown = false;
@@ -1976,6 +1991,8 @@ export class McpClientPool implements McpConnectionHost {
     this.toolTimeoutMs = Math.max(1, options.toolTimeoutMs ?? DEFAULT_MCP_TOOL_TIMEOUT_MS);
     this.spawnProcess = options.spawner ?? defaultMcpProcessSpawner;
     this.logLine = options.onLog ?? (() => undefined);
+    this.systemicFailure = options.onSystemicFailure ?? (() => undefined);
+    this.requestSuccess = options.onRequestSuccess ?? (() => undefined);
     this.nowFn = options.now ?? (() => Date.now());
     this.emitEvent = options.emit;
     this.dataDir = options.dataDir;
@@ -2361,7 +2378,9 @@ export class McpClientPool implements McpConnectionHost {
         timeoutMs,
         ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
-      return await this.renderToolResult(conn, toolName, result);
+      const rendered = await this.renderToolResult(conn, toolName, result);
+      this.requestSuccess(serverName);
+      return rendered;
     } catch (err) {
       return this.mapCallError(conn, toolName, err, timeoutMs);
     }
@@ -2430,6 +2449,7 @@ export class McpClientPool implements McpConnectionHost {
       reports.push(...await this.reapOne(conn, 'shutdown'));
     }
     this.connections.clear();
+    await Promise.all(this.resourceSamples);
     return reports;
   }
 
@@ -2599,6 +2619,7 @@ export class McpClientPool implements McpConnectionHost {
    *     那条路走的是 `startConnection` 的 catch。
    */
   private noteStartFailure(name: string, err: unknown): void {
+    this.systemicFailure({ serverName: name, category: 'start', message: errorText(err) });
     const now = this.nowFn();
     const previous = this.failures.get(name);
     // 重置：上一次成功启动之后**稳定运行满 `backoffResetMs`** ⇒ 这一次失败算第一次
@@ -2657,7 +2678,7 @@ export class McpClientPool implements McpConnectionHost {
     const pid = conn.pid;
     if (pid === undefined || !Number.isInteger(pid) || pid <= 0) return;
     const peak = conn.inFlightPeak;
-    void (async () => {
+    const task = (async () => {
       let sample: McpRssSample = { rssMb: null, source: 'unavailable' };
       try {
         sample = await sampler(pid);
@@ -2681,6 +2702,8 @@ export class McpClientPool implements McpConnectionHost {
         inFlightPeak: peak,
       });
     })();
+    this.resourceSamples.add(task);
+    void task.finally(() => { this.resourceSamples.delete(task); });
   }
 
   // ── 工具清单落盘缓存 ──
@@ -3003,6 +3026,7 @@ export class McpClientPool implements McpConnectionHost {
 
   /** 连接异常退出（非主动关停）：从池里摘掉并如实上报 crashed */
   onConnectionExit(conn: McpConnection, code: number | null, signal: string | null): void {
+    if (!conn.shutdownStarted && conn.handshakeCompleted) this.systemicFailure({ serverName: conn.serverName, category: 'crash', message: `process exited code=${code ?? 'null'} signal=${signal ?? 'null'}` });
     this.detach(conn);
     if (conn.shutdownStarted) return;
     if (!conn.markStopReported()) return;
@@ -3017,6 +3041,7 @@ export class McpClientPool implements McpConnectionHost {
 
   /** stdout 协议违规：先让在途请求失败，再按关机序列重启这个进程（§4.19 纪律 3） */
   onProtocolViolation(conn: McpConnection, detail: string): void {
+    if (conn.handshakeCompleted) this.systemicFailure({ serverName: conn.serverName, category: 'protocol', message: detail });
     this.logLine(
       `MCP server ${conn.serverName} 协议错误：${detail}。`
       + 'server 的 stdout 只允许写合法 JSON-RPC（日志走 stderr）；按纪律重启该进程。',
@@ -3030,6 +3055,10 @@ export class McpClientPool implements McpConnectionHost {
    * 取消宽限：发出 cancelled 之后给 server 一点收敛时间。宽限内没有回应（也不退出）的连接
    * 判定失效——这就是"超时即杀"的落点：不配合取消的 server 不能留在池里继续接调用。
    */
+  onRequestTimeout(conn: McpConnection, method: string): void {
+    if (conn.handshakeCompleted) this.systemicFailure({ serverName: conn.serverName, category: 'timeout', message: `${method} timed out` });
+  }
+
   gracefulCancel(conn: McpConnection, requestId: number, reason: string): void {
     void this.runGracefulCancel(conn, requestId, reason);
   }

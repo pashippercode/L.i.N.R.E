@@ -153,6 +153,8 @@ import { compactTimestamp } from '../tools/fs/text-codec.ts';
 import { estimateTokens } from '../tools/registry.ts';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { TimerStore } from '../wake/timer-store.js';
+import type { PluginManager } from '../plugin/manager.js';
+import { listPlugins, runPluginCommand } from '../plugin/http.ts';
 import type { DepsManager } from '../deps/manager.js';
 import { DEP_NAMES, type DepName } from '../deps/probe.ts';
 import type { ManagedServiceStatus } from '../services/snowluma.js';
@@ -460,6 +462,10 @@ export const CONFIRM_PHRASES: Record<string, string | null> = {
   // 与 set-key 同级：门挡的是误触（按钮点错、脚本里循环调用）——轮换一次，所有
   // 还没换凭据的外部投递方**立刻开始收 401**，那是个需要点头的动作，不是一次顺手点击。
   'regenerate-webhook-token': 'regenerate-webhook-token',
+  'plugin-install': 'plugin-install',
+  'plugin-confirm': 'plugin-confirm',
+  'plugin-enable': 'plugin-enable',
+  'plugin-disable': 'plugin-disable',
 };
 
 /**
@@ -690,6 +696,8 @@ export interface WebServerDeps {
    * 界面上分不清"没有依赖"与"没接上依赖"是最没用的那种观测）。
    */
   deps?: DepsManager | undefined;
+  /** 本地插件管理器；未注入时插件读写接口均返回 501。 */
+  plugins?: PluginManager | undefined;
   /**
    * 内置协议端（`channels.onebot.managed`，v34）。给了它才有 `GET/POST/PUT /api/protocol-side`：
    * 界面据此启停它、看它的状态、改它的目录。
@@ -3552,6 +3560,11 @@ class WebServerImpl implements WebServer {
 
     if (req.method === 'GET') {
       switch (path) {
+        case '/api/plugins': {
+          const result = listPlugins(this.deps.plugins);
+          sendJson(res, result.status, result.body);
+          return;
+        }
         case '/api/projection':
           sendJson(res, 200, this.deps.projection);
           return;
@@ -4971,6 +4984,14 @@ class WebServerImpl implements WebServer {
 
     const now = this.deps.now();
     switch (command) {
+      case 'plugin-install':
+      case 'plugin-confirm':
+      case 'plugin-enable':
+      case 'plugin-disable': {
+        const result = runPluginCommand(command, payload, this.deps.plugins);
+        sendJson(res, result.status, result.body);
+        return;
+      }
       case 'reset-context': {
         // 清空对话历史：**不删事件**（日志是唯一真相源，删了就没法复盘），而是写一条遮蔽摘要，
         // 把 coveredUpToSeq 推到当前水位——渲染层从此只看这之后的事件，等于给她一个干净的上下文。

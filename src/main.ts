@@ -13,6 +13,7 @@
  * 编译输出由 rewriteRelativeImportExtensions 改回 .js。
  */
 
+import { AGENT_VERSION } from './version.ts';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, join, resolve, sep } from 'node:path';
@@ -68,6 +69,12 @@ import {
   type GuiGuard, type GuiGuardRecord,
 } from './runtime/gui-guard.ts';
 import { FakeLoop, maxTurnOfLog } from './runtime/loop.ts';
+import { PluginManager } from './plugin/manager.ts';
+import { PluginCircuitBreaker } from './plugin/circuit-breaker.ts';
+import { composePluginHooks, composePluginMcp } from './plugin/contributions.ts';
+import type { PluginFailure } from './plugin/failures.js';
+import { composePluginRuntime, mapPluginMcpOwners, mergeMcpDeclarations, pluginProtectedPaths, type PluginRuntimeComposition } from './plugin/runtime.ts';
+import { allEventsOf } from './state/event-snapshot.ts';
 import { EVENT_LOG_DIR_NAME, TIMER_FILE_NAME, recover, type RecoverResult } from './runtime/recover.ts';
 import { TimerStore } from './wake/timer-store.ts';
 import {
@@ -101,7 +108,7 @@ import {
  * （**具体是第几个内测版、版号是什么，以这一行的字面量为准**——别把版号抄进注释：
  * 出包脚本只改版号那一行、不改注释，抄一处就留一处对不上）。
  */
-export const AGENT_VERSION = '0.1.0-beta.12';
+export { AGENT_VERSION } from './version.ts';
 /** 事件形状版本（docs/schema.md） */
 export const SCHEMA_VERSION = '1';
 export const DEFAULT_DATA_DIR_NAME = 'data';
@@ -559,6 +566,64 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     return event;
   };
 
+  const pluginManager = new PluginManager(dataDir, (type, data) => {
+    append(type, data, 'internal');
+  });
+  pluginManager.setEvents(await allEventsOf(log));
+  let pluginRuntime = composePluginRuntime(pluginManager, config.mcp.extraLaunchers);
+  let pluginMcpOwners = new Map<string, { pluginId: string; contentHash: string }>();
+  let circuitBreaker: PluginCircuitBreaker | null = null;
+  let replacePluginHooks: (entries: Parameters<HookRunner['setEntries']>[0]) => void = () => {};
+  let replacePluginSkills: (roots: PluginRuntimeComposition['skillRoots']) => void = () => {};
+  for (const warning of pluginRuntime.warnings) write(`[插件] ${warning}`);
+  const mcpDeclarations = (): readonly import('./mcp/client.js').McpServerEntry[] => {
+    pluginMcpOwners = mapPluginMcpOwners(config.mcp.servers, pluginRuntime.packages, config.mcp.extraLaunchers);
+    try {
+      return mergeMcpDeclarations(config.mcp.servers, pluginRuntime.mcpServers);
+    } catch (error) {
+      write(`[插件] MCP 声明冲突，保留内置配置：${describeError(error)}`);
+      return config.mcp.servers;
+    }
+  };
+  let runtimeApplyChain: Promise<unknown> = Promise.resolve();
+  const applyRuntimeDeclarations = <T>(action: (declarations: () => readonly import('./mcp/client.js').McpServerEntry[]) => Promise<T>): Promise<T> => {
+    const run = runtimeApplyChain.then(async () => await action(mcpDeclarations));
+    runtimeApplyChain = run.catch(() => undefined);
+    return run;
+  };
+  const applyPluginRuntime = (): Promise<void> => applyRuntimeDeclarations(async (currentDeclarations) => {
+    pluginRuntime = composePluginRuntime(pluginManager, config.mcp.extraLaunchers);
+    const owners = mapPluginMcpOwners(config.mcp.servers, pluginRuntime.packages, config.mcp.extraLaunchers);
+    pluginMcpOwners = owners;
+    replacePluginSkills(pluginRuntime.skillRoots);
+    replacePluginHooks(pluginRuntime.hookEntries);
+    await mcpPoolRef.pool?.applyDeclarations(currentDeclarations());
+    for (const warning of pluginRuntime.warnings) write(`[插件] ${warning}`);
+  });
+  const mcpPluginFailure = (serverName: string, category: PluginFailure['category'], message: string): PluginFailure | null => {
+    const owner = pluginMcpOwners.get(serverName);
+    if (owner === undefined) return null;
+    return { ...owner, contributionKind: 'mcp', contributionName: serverName, category, message };
+  };
+  const probePlugin = async (id: string, hash: string): Promise<void> => {
+    const view = pluginManager.list().find((item) => item.package.manifest.id === id && item.package.contentHash === hash && item.state === 'probing');
+    if (view === undefined) return;
+    const hooks = composePluginHooks([view.package]);
+    if (hooks.warnings.length > 0) throw new Error(hooks.warnings.join('; '));
+    const mcp = composePluginMcp([view.package], config.mcp.extraLaunchers);
+    if (mcp.warnings.length > 0 || (view.package.manifest.contributions.mcp !== undefined && mcp.servers.length === 0)) {
+      throw new Error(mcp.warnings.join('; ') || 'MCP declaration has no usable server');
+    }
+    if (mcp.servers.length === 0) return;
+    const pool = new McpClientPool({ servers: mcp.servers, dataDir, toolsCache: false, emit: () => {},
+      onLog: (line) => { write(`[插件探测] ${line}`); } });
+    try {
+      for (const server of mcp.servers) await pool.listTools(server.name, { requireConnected: true });
+    } finally {
+      await pool.shutdown();
+    }
+  };
+
   /**
    * 同 [append]，但**把分配到的 seq 交给载荷构造器**。
    *
@@ -946,6 +1011,7 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
   // 每一项都指得出它的定义处，不再手写同义字面量。
   const protectedPaths: readonly string[] = [
     ...protectedHookPaths(dataDir),
+    ...pluginProtectedPaths(dataDir),
     keysPath(dataDir),                                    // data/.keys.json：模型与通道密钥
     join(dataDir, AUTH_FILE_NAME),                        // data/.auth.json：界面密码与会话凭据
     join(dataDir, WEBHOOK_SECRET_FILE_NAME),              // data/.webhook-secret.json：webhook 专用凭据
@@ -1028,7 +1094,7 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
    * 永远不会被调用（不跑模型就不派发工具），所以它也不会拉起任何外部进程。
    */
   const mcpPool = new McpClientPool({
-    servers: config.mcp.servers,
+    servers: mcpDeclarations(),
     // 生命周期事件落 mcp/server-started / mcp/server-stopped（internal）：
     // 界面「扩展 → MCP」的运行期状态就是从这两条折出来的（mcpView）
     //
@@ -1038,6 +1104,7 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     // `vision_read` / `speak` 那两个洞的形状，见 resolveEventVisibility 的注释）。
     emit: (type, data) => { append(type, data, resolveEventVisibility(type, 'internal')); },
     dataDir,
+    now: () => now().getTime(),
     onLog: (line) => { write(`[MCP] ${line}`); },
     // 两格池级参数（2026-10-10 接线，出厂值在 config.ts 的 mcp 段）：
     //   · maxInFlight = **整池**在飞上限（超限如实拒绝、不排队；极多 server + 子代理并发时往上调，
@@ -1046,8 +1113,17 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     //     IRMIA_MCP_RSS_SAMPLE 比它优先，见 client.ts 的 resolveRssSampler）。
     maxInFlight: config.mcp.maxInFlight,
     rssSample: config.mcp.rssSample,
+    onSystemicFailure: (signal) => {
+      const failure = mcpPluginFailure(signal.serverName, signal.category, signal.message);
+      if (failure !== null) circuitBreaker?.noteFailure(failure);
+    },
+    onRequestSuccess: (serverName) => {
+      const failure = mcpPluginFailure(serverName, 'timeout', '');
+      if (failure !== null) circuitBreaker?.noteSuccess(failure);
+    },
   });
   mcpPoolRef.pool = mcpPool;
+  circuitBreaker = new PluginCircuitBreaker({ manager: pluginManager, now: () => now().getTime(), apply: applyPluginRuntime, probe: probePlugin });
   if (config.mcp.servers.length === 0) {
     write('[MCP] config.json 里没有声明任何 server（mcp.servers[] 为空）：'
       + '`mcp` 工具照常在她手里，调用时会如实说"没有已声明的 server"');
@@ -1118,7 +1194,8 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     // 失败也不吞：catch 里如实写一行。
     void (async () => {
       try {
-        const declChange = await mcpPool.applyDeclarations(config.mcp.servers);
+        const declChange = await applyRuntimeDeclarations(async (currentDeclarations) => await mcpPool.applyDeclarations(currentDeclarations()));
+        const declarations = mcpDeclarations();
         const touched = declChange.added.length + declChange.removed.length + declChange.changed.length;
         if (touched === 0) {
           // 走到这里只有一种情形：`mcp.servers` 这个字段变了、但**每个 server 的内容都没变**
@@ -1126,7 +1203,7 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
           write('[MCP] 声明面变了但每个 server 的内容都一样（多半只调了次序）：不重连、不通报');
           return;
         }
-        const note = mcpReloadNoteOf(declChange, config.mcp.servers.length);
+        const note = mcpReloadNoteOf(declChange, declarations.length);
         const event = append('wake/manual', {
           note,
           // 与 web 侧 `wakeForMcpChange` 同一格：界面据此把它渲染成**框架卡片**而不是"用户说的话"
@@ -1331,15 +1408,24 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     for (const problem of hookConfig.problems) write(`[Hook] 配置条目被跳过：${problem}`);
     // enabled: false 的条目保留在文件里但不装配：GUI 的开关就是"临时停用一条钩子"，
     // 与"删掉这条钩子"是两件事（前者把命令行留着，后者要重新拼一遍）。
-    const hookEntries = hookConfig.entries.filter((entry) => entry.enabled !== false);
-    const hookDisabled = hookConfig.entries.length - hookEntries.length;
+    const builtinHookEntries = hookConfig.entries.filter((entry) => entry.enabled !== false);
+    const hookDisabled = hookConfig.entries.length - builtinHookEntries.length;
     const hooks = new HookRunner({
-      entries: hookEntries,
-      emit: (fired) => { emit('hook/fired', { hook: fired.hook, outcome: fired.outcome }); },
+      entries: [...builtinHookEntries, ...pluginRuntime.hookEntries],
+      emit: (fired) => {
+        emit('hook/fired', { hook: fired.hook, outcome: fired.outcome,
+          ...(fired.pluginId === undefined ? {} : { pluginId: fired.pluginId, contentHash: fired.contentHash, contributionName: fired.contributionName }) });
+        if (fired.pluginId === undefined || fired.contentHash === undefined || fired.contributionName === undefined) return;
+        const failure: PluginFailure = { pluginId: fired.pluginId, contentHash: fired.contentHash, contributionKind: 'hook',
+          contributionName: fired.contributionName, category: fired.outcome === 'timeout' ? 'hook-timeout' : 'hook-error', message: `Hook ${fired.outcome}` };
+        if (fired.outcome === 'ok') circuitBreaker?.noteSuccess(failure);
+        else circuitBreaker?.noteFailure(failure);
+      },
       onNote: (text) => { write(`[Hook] ${text}`); },
       // 投影摘要是活数据：每次 fork 前现取，不缓存（钩子看到的必须当时那一刻的事实）
       digest: () => digestProjection(recovery.projection),
     });
+    replacePluginHooks = (entries) => { hooks.setEntries([...builtinHookEntries, ...entries]); };
     if (hooks.size > 0) {
       write(`[Hook] ${hookConfigPath(dataDir)} 已装配 ${hooks.size} 条钩子`
         + `${hookDisabled > 0 ? `（另有 ${hookDisabled} 条被停用）` : ''}`);
@@ -1534,17 +1620,21 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     // 只有过了信任门（skill/installed{by:'human'}）的 skill 才进 catalog——启动时把话说清楚。
     const skills = new SkillManager({
       baseRoot: process.cwd(),
+      packageRoots: pluginRuntime.skillRoots,
       out: write,
       emit: (type, data, visibility) => {
         append(type, data, visibility);
       },
     });
     for (const line of skills.startupWarnings()) write(line);
+    replacePluginSkills = (roots) => { skills.setPackageRoots(roots); };
 
     loop = new RealLoop({
       log, dataDir, projection: recovery.projection, now,
       timezone: config.timezone ?? 'Asia/Shanghai',
       ds, registry, persona, config, out: write,
+      mcpDeclarations,
+      onTurnBoundary: async () => { await circuitBreaker?.drain(); },
       // 版本号（`runtime/restart` 的通报里要说"你现在跑的是哪一版"）：给的是**同一个常量**
       // ——`session/start.version` 写的也是它。循环自己不去盘上读 `package.json`：
       // 版本号的唯一真相源就是这一行（见它的注释），多读一处就是多一个会漂的口径。
@@ -1669,6 +1759,7 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
       dataDir,
       timers,
       now,
+      plugins: pluginManager,
       ...(toolRegistry !== undefined ? { registry: toolRegistry } : {}),
       // 更新检查的数据口（GET /api/update 与 POST /api/update/check 的宿主）
       update: updateService,
@@ -2011,7 +2102,9 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
     // 配置热重载：先撤监听（fs.watch 与那路 250ms 轮询），再做后面那些收尾
     // ——退出过程中不该再有"配置变了 ⇒ 重连一个 MCP server"，那会与下面的池关机打起来。
     configWatcher.stop();
-    loop.stop();
+    await circuitBreaker?.stop();
+    await runtimeApplyChain;
+    await loop.stop();
 
     // MCP server 是**别人的进程**：框架拉起来的就得由框架收尸（与上面协议端同一条纪律）。
     // 走池自己的关机序列，收不掉时如实说出是哪几个——"留了一个孤儿进程"必须看得见。
@@ -2059,6 +2152,7 @@ export async function runMain(options: MainOptions = {}): Promise<MainHandle> {
   }
 
   // ── 起拍 ──
+  circuitBreaker?.start();
   loop.start();
   // 保活跟着主循环起拍（`start()` 会**先跑一拍**：布防当场就有一次"界面在不在"的读数）
   guiGuardRef.guard?.start();

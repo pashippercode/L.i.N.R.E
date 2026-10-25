@@ -257,6 +257,53 @@ test('M7-1 全链路：握手 → initialized → tools/list → tools/call，�
   assert.match(failed.content, /夹具主动报告的工具失败/);
 });
 
+test('插件故障信号：真实响应上报成功，业务 isError 不上报系统性故障', async (t) => {
+  const failures: unknown[] = [];
+  const successes: string[] = [];
+  const h = createHarness(t, { pool: {
+    onSystemicFailure: (failure: unknown) => failures.push(failure),
+    onRequestSuccess: (name: string) => successes.push(name),
+  } });
+  const failed = await h.pool.callTool('fake', 'fail', {});
+  assert.equal(failed.isError, true);
+  const ok = await h.pool.callTool('fake', 'echo', { text: 'ok' });
+  assert.equal(ok.isError ?? false, false);
+  assert.deepEqual(failures, []);
+  assert.deepEqual(successes, ['fake', 'fake']);
+});
+
+test('插件故障信号：握手期进程退出只计一次 start，不重复计 crash', async (t) => {
+  const failures: Array<{ category: string }> = [];
+  const h = createHarness(t, { pool: {
+    requestTimeoutMs: 5,
+    onSystemicFailure: (failure: { category: string }) => failures.push(failure),
+  } });
+  const stopped = await h.pool.callTool('fake', 'echo', { text: 'x' });
+  assert.equal(stopped.isError, true);
+  assert.deepEqual(failures.map((failure) => failure.category), ['start']);
+});
+
+test('插件故障信号：tools/list 握手窗口只计一次 start', async (t) => {
+  const failures: Array<{ category: string }> = [];
+  const h = createHarness(t, { requestTimeoutMs: 100, env: { FAKE_MCP_HANG_LIST: '1' }, pool: {
+    onSystemicFailure: (failure: { category: string }) => failures.push(failure),
+  } });
+  const stopped = await h.pool.callTool('fake', 'echo', { text: 'x' });
+  assert.equal(stopped.isError, true);
+  assert.deepEqual(failures.map((failure) => failure.category), ['start']);
+});
+
+test('插件故障信号：握手完成后的进程退出计一次 crash', async (t) => {
+  const failures: Array<{ category: string }> = [];
+  const h = createHarness(t, { env: { FAKE_MCP_EXIT_ON_CALL: '1' }, pool: {
+    onSystemicFailure: (failure: { category: string }) => failures.push(failure),
+  } });
+  const stopped = await h.pool.callTool('fake', 'echo', { text: 'x' });
+  assert.equal(stopped.isError, true);
+  await waitFor(() => failures.length > 0, 1000, 'crash 故障信号');
+  assert.deepEqual(failures.map((failure) => failure.category), ['crash']);
+});
+
 test('M7-3 默认不信任：MCP 工具 destructive 注册，annotations 不参与三属性判定', async (t) => {
   const h = createHarness(t);
   await h.pool.registerAll();
@@ -1095,6 +1142,25 @@ test('A② 成功之后稳定运行满重置窗口 ⇒ 计数归零（不拿"很
 });
 
 // ──────────────────────────────── A③ 资源观测（2026-10-10） ────────────────────────────────
+
+test('A③ 关机等待在飞 RSS 采样，不遗留采样器句柄', async (t) => {
+  let release: (() => void) | undefined;
+  let sampled = false;
+  const h = createHarness(t, { pool: { rssSampler: async () => {
+    await new Promise<void>((resolve) => { release = resolve; });
+    sampled = true;
+    return { rssMb: 1, source: 'proc' as const };
+  } } });
+  await h.pool.listTools('fake', { requireConnected: true });
+  let stoppedEarly = false;
+  const stopped = h.pool.shutdown().then(() => { stoppedEarly = true; });
+  await new Promise<void>((resolve) => { setImmediate(resolve); });
+  assert.equal(stoppedEarly, false);
+  assert.equal(sampled, false);
+  release!();
+  await stopped;
+  assert.equal(sampled, true);
+});
 
 test('A③ 资源观测：启动耗时 / RSS / 在飞峰值 / 回收时刻 都进 internal 事件与快照', async (t) => {
   const h = createHarness(t, {

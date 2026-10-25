@@ -2372,6 +2372,25 @@ export interface SkillInstalled extends EventEnvelope<'skill/installed', {
   contentHash?: string;
 }> {}
 
+export interface PluginInstalled extends EventEnvelope<'plugin/installed', {
+  id: string; version: string; contentHash: string; path: string; by: 'human';
+}> {}
+export interface PluginEnabled extends EventEnvelope<'plugin/enabled', { id: string; contentHash: string }> {}
+export interface PluginDisabled extends EventEnvelope<'plugin/disabled', { id: string; contentHash: string }> {}
+export interface PluginFailed extends EventEnvelope<'plugin/failed', { id: string; contentHash: string; reason: string }> {}
+export interface PluginQuarantined extends EventEnvelope<'plugin/quarantined', {
+  id: string; contentHash: string; contributionKind: string; contributionName: string;
+  category: string; count: number; retryAt: string; failedAt: string; reason: string;
+}> {}
+export interface PluginProbeStarted extends EventEnvelope<'plugin/probe-started', {
+  id: string; contentHash: string; contributionKind: string; contributionName: string;
+  category: string; count: number; probeAt: string;
+}> {}
+export interface PluginRecovered extends EventEnvelope<'plugin/recovered', {
+  id: string; contentHash: string; contributionKind: string; contributionName: string;
+  category: string; count: number; recoveredAt: string;
+}> {}
+
 // ──────────────────── 申请单：她发起、用户只在界面点批准或驳回（2026-10-11） ────────────────────
 
 /**
@@ -2533,6 +2552,7 @@ export type GrantKind = 'mcp-add' | 'mcp-remove' | 'skill-install' | 'skill-remo
 export interface HookFired extends EventEnvelope<'hook/fired', {
   hook: 'PreToolUse' | 'PostToolUse' | 'Wake';
   outcome: 'ok' | 'timeout' | 'error';
+  pluginId?: string; contentHash?: string; contributionName?: string;
 }> {}
 
 export interface SpeakSent extends EventEnvelope<'speak/sent', {
@@ -3260,6 +3280,8 @@ export type AppEvent =
   | AlarmSent | ReviewResolved | SnapshotCheckpoint | CompactionSummary | CompactionDecision
   | PersonaUpdated | ConfigChanged | MemoryMaintained | MemorySelected | MemoryRead
   | McpServerStarted | McpServerStopped | McpServerResource | McpIndex | SkillIndex | SkillInstalled | HookFired | SpeakSent
+  | PluginInstalled | PluginEnabled | PluginDisabled | PluginFailed
+  | PluginQuarantined | PluginProbeStarted | PluginRecovered
   | ToolsInventoryChanged
   | GrantRequested | GrantResolved
   | IntentionRaised | IntentionActed | TodoUpdated
@@ -3386,6 +3408,9 @@ export const EVENT_VISIBILITY: Record<string, Visibility> = {
   // 两遍，第二遍纯属常驻开销。写在这里而不是靠 defaultVisibility 兜底，是为了让"这条线是有意
   // 画的"看得见——缓存保护的那条线（索引字节只在归集时改）正是靠它成立的。
   'skill/index': 'internal',
+  'plugin/installed': 'internal', 'plugin/enabled': 'internal',
+  'plugin/disabled': 'internal', 'plugin/failed': 'internal',
+  'plugin/quarantined': 'internal', 'plugin/probe-started': 'internal', 'plugin/recovered': 'internal',
   // 工具清单指纹的变化（2026-10-11，BUG-3）**同样刻意 internal**，理由与上面那条逐字同形：
   // 它是**装配账**（"这一刻进请求的清单是哪几件、比上次少了哪几件"），而清单本身已经作为
   // tools 段进了请求体——再把它作为一条事件渲染一遍，就是同一件事在她眼前出现两遍。
