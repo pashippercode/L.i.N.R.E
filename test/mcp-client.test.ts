@@ -49,6 +49,7 @@ import { readBlob } from '../src/state/blob-store.ts';
 import { executeToolCalls } from '../src/tools/executor.ts';
 import { ToolRegistry } from '../src/tools/registry.ts';
 import type { ToolContext } from '../src/tools/types.js';
+import { AGENT_VERSION } from '../src/version.ts';
 import { tempDirSync } from './helpers/temp-dirs.ts';
 
 // ──────────────────────────────── 脚手架 ────────────────────────────────
@@ -240,7 +241,10 @@ test('M7-1 全链路：握手 → initialized → tools/list → tools/call，�
   assert.ok(initialize !== undefined, '夹具收到了 initialize');
   // 不声明 roots/sampling/elicitation：capabilities 就是空对象
   assert.deepEqual(initialize.capabilities, {});
-  assert.deepEqual(initialize.clientInfo, { name: 'irmia-agent', version: '0.1.0-beta.12' });
+  // clientInfo 是给 server 侧日志认人用的：name 是协议面常量，version 必须原样取自 AGENT_VERSION。
+  // 这里断言的是"进程版本号被写进握手帧"这条契约，而不是某个具体版本文本——写死字符串会成为
+  // 第二份版本真相，每次发版都要手动跟一次，跟漏了也不会有人发现。
+  assert.deepEqual(initialize.clientInfo, { name: 'irmia-agent', version: AGENT_VERSION });
   assert.ok(marks.some((m) => m.t === 'initialized'), '握手第二步发了 notifications/initialized');
   assert.equal(marks.filter((m) => m.t === 'list').length, 1, 'tools/list 在进程启动时拉一次');
   assert.equal(marks.find((m) => m.t === 'call')?.name, 'echo');

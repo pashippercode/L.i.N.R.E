@@ -59,7 +59,7 @@ function compareVersions(a: string, b: string): number {
     if (typeof a === 'number' && typeof b === 'number') return a - b;
     if (typeof a === 'number') return -1;
     if (typeof b === 'number') return 1;
-    return a.localeCompare(b);
+    return a < b ? -1 : a > b ? 1 : 0; // SemVer 规定 ASCII 码点序，不用 locale 排序
   }
   return 0;
 }

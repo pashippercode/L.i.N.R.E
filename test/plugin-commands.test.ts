@@ -122,9 +122,13 @@ test('安装不授予信任，确认和启停返回最新状态且启停要求�
   assert.equal(enabled.body.plugin.state, 'enabled');
   assert.equal(enabled.body.plugin.requiresRestart, true);
   assert.equal((await command(fx, 'plugin-confirm', { id, contentHash: hash })).status, 200);
+  // 宿主已经按这份日志装配过一次（等价于重启后重放）：在此基础上重复启用同一条，
+  // 运行面一点没变，回执就不该再说「要重启」
+  fx.manager!.setEvents(await fx.events());
   const duplicateEnable = await command(fx, 'plugin-enable', { id, contentHash: hash });
   assert.equal(duplicateEnable.status, 200);
-  assert.equal(duplicateEnable.body.restartRequired, true);
+  assert.equal(duplicateEnable.body.restartRequired, false);
+  assert.equal(duplicateEnable.body.plugin.requiresRestart, false);
   assert.deepEqual((await fx.events()).map((event) => event.type), ['plugin/installed', 'plugin/enabled']);
   const disabled = await command(fx, 'plugin-disable', { id, contentHash: hash });
   assert.equal(disabled.status, 200, disabled.text);

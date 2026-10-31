@@ -60,6 +60,7 @@ import { blobPointerText } from '../model/render.ts';
 import {
   DEFAULT_BLOB_PREVIEW_CHARS, DEFAULT_BLOB_THRESHOLD_TOKENS, offloadIfLarge,
 } from '../state/blob-store.ts';
+import { AGENT_VERSION } from '../version.ts';
 
 // ──────────────────────────────── 常量 ────────────────────────────────
 
@@ -74,10 +75,16 @@ export const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u;
 export const DEFAULT_PROTOCOL_VERSION = '2025-06-18';
 export const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = ['2025-06-18', '2025-03-26', '2024-11-05'];
 
-/** clientInfo（握手时上报；server 侧日志靠它辨认调用方）。version 与 main.ts 的 AGENT_VERSION 同步 */
+/**
+ * clientInfo（握手时上报；server 侧日志靠它辨认调用方）。
+ *
+ * version 直接取 `AGENT_VERSION`，不在这里另抄一份：这个字段的真实用途是让 server 侧日志
+ * 认出调用方是哪个版本的客户端。手抄的那份一旦漏改，排障时就会把新版客户端认成旧版，
+ * 而且没有任何地方会报错——单一来源至少让"版本号是多少"只有一个答案。
+ */
 export const DEFAULT_CLIENT_INFO: { readonly name: string; readonly version: string } = {
   name: 'irmia-agent',
-  version: '0.1.0-beta.12',
+  version: AGENT_VERSION,
 };
 
 /** 每请求软超时：progress 通知可重置这个时钟 */

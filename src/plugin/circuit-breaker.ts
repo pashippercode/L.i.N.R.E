@@ -1,4 +1,4 @@
-import { isSystemicPluginFailure, type PluginFailure } from './failures.ts';
+import { isSystemicPluginFailure, PluginProbeCancelledError, type PluginFailure } from './failures.ts';
 import type { PluginManager } from './manager.js';
 
 export interface PluginCircuitBreakerOptions {
@@ -83,13 +83,14 @@ export class PluginCircuitBreaker {
       if (view.state !== 'quarantined' || circuit?.retryAt === undefined || Date.parse(circuit.retryAt) > this.now()) continue;
       const key = `${view.package.manifest.id}\0${view.package.contentHash}`;
       if (this.probing.has(key)) continue;
-      if (!this.manager.beginProbe(view.package.manifest.id, view.package.contentHash, new Date(this.now()).toISOString())) continue;
+      const probeAt = new Date(this.now()).toISOString();
+      if (!this.manager.beginProbe(view.package.manifest.id, view.package.contentHash, probeAt)) continue;
       if (circuit.contributionKind === 'hook') {
         this.dirty = true;
         continue;
       }
       this.probing.add(key);
-      probes.push(this.runProbe(view.package.manifest.id, view.package.contentHash, key));
+      probes.push(this.runProbe(view.package.manifest.id, view.package.contentHash, key, probeAt));
     }
     if (applyPending) await this.flushApply();
     await Promise.all(probes);
@@ -103,13 +104,22 @@ export class PluginCircuitBreaker {
     }
   }
 
-  private async runProbe(id: string, hash: string, key: string): Promise<void> {
+  private async runProbe(id: string, hash: string, key: string, probeAt: string): Promise<void> {
     try {
       await this.probe(id, hash);
       const view = this.manager.list().find((item) => item.package.manifest.id === id && item.package.contentHash === hash && item.state === 'probing');
       if (view !== undefined && view.circuit?.contributionKind !== 'hook') this.manager.recovered(id, hash, new Date(this.now()).toISOString());
       this.dirty = true;
     } catch (error) {
+      // 取消不是失败：宿主关停时会先把在飞的探测池 shutdown 掉，探针被拒是「我们主动
+      // 收摊」，不是被探测方又坏了一次。这条必须先判——否则关一次进程就让隔离期按
+      // 30s×2^strikes 翻倍，还凭空写一条 plugin/quarantined 假事实。
+      if (error instanceof PluginProbeCancelledError) {
+        // 只还原内存态（隔离中、立刻可重试）。日志里那条 plugin/probe-started 重放时
+        // 本来就会折回这个形状，所以不补事件也不会让重放漂移。
+        this.manager.abortProbe(id, hash, probeAt);
+        return;
+      }
       const view = this.manager.list().find((item) => item.package.manifest.id === id && item.package.contentHash === hash);
       const circuit = view?.circuit;
       if (circuit) {

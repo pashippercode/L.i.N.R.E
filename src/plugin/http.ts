@@ -66,7 +66,10 @@ export function runPluginCommand(
     if (plugin === undefined) return failure('plugin-error', `Plugin ${id}@${contentHash} not found after command`);
     return {
       status: 200,
-      body: { ok: true, plugin, ...(command === 'plugin-confirm' ? {} : { restartRequired: true }) },
+      // 回执回答的是「这次命令之后，宿主还需要为它重启吗」——判据只能是插件自己的
+      // requiresRestart（本次启停是否还没被装配过），不能对启停一律回答「要重启」：
+      // 重复启用一条已生效的插件时运行面一点没变，说「要重启」就是自相矛盾。
+      body: { ok: true, plugin, ...(command === 'plugin-confirm' ? {} : { restartRequired: plugin.requiresRestart }) },
     };
   } catch (error) {
     return failure('plugin-error', error);

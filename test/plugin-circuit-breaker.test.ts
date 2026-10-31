@@ -5,7 +5,7 @@ import test from 'node:test';
 
 import type { AppEvent } from '../src/log/types.ts';
 import { PluginCircuitBreaker } from '../src/plugin/circuit-breaker.ts';
-import { isSystemicPluginFailure, type PluginFailure } from '../src/plugin/failures.ts';
+import { isSystemicPluginFailure, PluginProbeCancelledError, type PluginFailure } from '../src/plugin/failures.ts';
 import { PluginManager } from '../src/plugin/manager.ts';
 import { tempDirSync } from './helpers/temp-dirs.ts';
 import { makeRealWakeRig } from './fixtures/real-wake-rig.ts';
@@ -107,6 +107,48 @@ test('探测失败指数退避到十五分钟', async () => {
     assert.equal(circuit.state, 'quarantined');
     assert.equal(Date.parse(circuit.retryAt!) - h.now(), expected);
   }
+});
+
+test('探针被取消不算失败：还原成隔离态，计数与 strike 不变，也不写 plugin/quarantined', async () => {
+  const h = harness(async () => { throw new PluginProbeCancelledError(); });
+  for (let i = 0; i < 3; i += 1) h.breaker.noteFailure(failure);
+  const before = h.manager.list()[0]!.circuit!;
+  assert.equal(before.count, 3);
+  assert.equal(before.strikes, 1);
+  h.tick(Date.parse(before.retryAt!) - h.now());
+  const quarantinedEvents = h.events.filter((event) => event.type === 'plugin/quarantined').length;
+  await h.breaker.drain();
+
+  const view = h.manager.list()[0]!;
+  assert.equal(view.state, 'quarantined');
+  assert.equal(view.circuit!.count, before.count, '取消不是一次新的失败，计数不能涨');
+  assert.equal(view.circuit!.strikes, before.strikes, 'strike 不涨，隔离期才不会平白翻倍');
+  assert.equal(view.circuit!.lastError, before.lastError);
+  assert.equal(view.circuit!.contributionName, before.contributionName);
+  assert.equal(h.events.filter((event) => event.type === 'plugin/quarantined').length, quarantinedEvents,
+    '取消不该在日志里留下一条「它又坏了」');
+  // 立刻可重试：retryAt 回到本次探针开始的时刻，而不是被推后一档退避
+  assert.equal(Date.parse(view.circuit!.retryAt!), h.now());
+});
+
+test('取消之后再来一次真实失败照样涨 strike、写隔离事件', async () => {
+  let cancelled = true;
+  const h = harness(async () => {
+    if (cancelled) throw new PluginProbeCancelledError();
+    throw new Error('still broken');
+  });
+  for (let i = 0; i < 3; i += 1) h.breaker.noteFailure(failure);
+  h.tick(30_000);
+  await h.breaker.drain();
+  assert.equal(h.manager.list()[0]!.state, 'quarantined');
+  assert.equal(h.manager.list()[0]!.circuit!.strikes, 1);
+
+  cancelled = false;
+  await h.breaker.drain();
+  const circuit = h.manager.list()[0]!.circuit!;
+  assert.equal(circuit.strikes, 2, '真实失败照常累加 strike');
+  assert.equal(circuit.count, 4);
+  assert.equal(h.events.at(-1)?.type, 'plugin/quarantined');
 });
 
 test('进程死在半开状态后重启会立即重试，不会永久卡住', async () => {

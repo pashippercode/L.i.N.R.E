@@ -83,6 +83,66 @@ test('插件 Hook 默认包 cwd，相对 cwd 不可逃逸，运行时使用条�
   assert.equal(tasks[0]?.cwd, join(root, 'nested'));
 });
 
+test('enabled: false 的 Hook 条目不装配，全停用的插件不贡献任何 Hook', () => {
+  const { root, package: pkg } = plugin();
+  writeFileSync(join(root, 'hooks.json'), JSON.stringify([
+    { hook: 'Wake', matcher: 'manual', command: 'node on.mjs' },
+    { hook: 'Wake', matcher: 'timer', command: 'node off.mjs', enabled: false },
+  ]));
+  pkg.manifest = { ...pkg.manifest, contributions: { skills: [], hooks: 'hooks.json' } };
+  const mixed = composePluginHooks([pkg]);
+  assert.deepEqual(mixed.entries.map((entry) => entry.plugin?.contributionName), ['Wake:manual#0']);
+  assert.deepEqual(mixed.warnings, []);
+
+  // 一个插件的钩子全停用时，它贡献 0 条：既不留空壳，也不算配置错误
+  writeFileSync(join(root, 'hooks.json'), JSON.stringify([
+    { hook: 'Wake', matcher: 'manual', command: 'node on.mjs', enabled: false },
+    { hook: 'PreToolUse', matcher: '.*', command: 'node off.mjs', enabled: false },
+  ]));
+  const allOff = composePluginHooks([pkg]);
+  assert.deepEqual(allOff.entries, []);
+  assert.deepEqual(allOff.warnings, []);
+});
+
+test('停用的 Hook 条目一次进程都不起', async () => {
+  const { root, package: pkg } = plugin();
+  writeFileSync(join(root, 'hooks.json'), JSON.stringify([
+    { hook: 'Wake', matcher: 'manual', command: 'node on.mjs' },
+    { hook: 'Wake', matcher: 'manual', command: 'node off.mjs', enabled: false },
+  ]));
+  pkg.manifest = { ...pkg.manifest, contributions: { skills: [], hooks: 'hooks.json' } };
+  const tasks: HookTask[] = [];
+  const runner = new HookRunner({
+    entries: composePluginHooks([pkg]).entries,
+    cwd: root,
+    spawn: (task) => {
+      tasks.push(task);
+      const close: ((code: number | null) => void)[] = [];
+      const process: HookProcess = {
+        onStdout: () => {}, onStderr: () => {}, onClose: (handler) => close.push(handler),
+        write: () => {}, endInput: () => close.forEach((handler) => handler(0)), kill: () => {},
+      };
+      return process;
+    },
+  });
+  await runner.wake({ text: '', sources: ['manual'], turn: 1 });
+  assert.deepEqual(tasks.map((task) => task.command), ['node on.mjs']);
+});
+
+test('插件显式声明的 Hook 文件缺失时给出 warning，而不是静默消失', () => {
+  const { package: pkg } = plugin();
+  pkg.manifest = { ...pkg.manifest, contributions: { skills: [], hooks: 'hooks.json' } };
+  const composed = composePluginHooks([pkg]);
+  assert.deepEqual(composed.entries, []);
+  assert.equal(composed.warnings.length, 1);
+  assert.match(composed.warnings[0] ?? '', /hooks[.]json/);
+  assert.match(composed.warnings[0] ?? '', /不存在|不可读/);
+
+  // 对照：MCP 声明文件缺失早就有 warning，这条既有行为不该退化
+  pkg.manifest = { ...pkg.manifest, contributions: { skills: [], mcp: 'mcp.json' } };
+  assert.equal(composePluginMcp([pkg], []).warnings.length, 1);
+});
+
 test('MCP 名称命名空间化、保留属性并默认包 cwd', () => {
   const { root, package: pkg } = plugin();
   writeFileSync(join(root, 'mcp.json'), JSON.stringify([{ name: 'chat', command: process.execPath, args: ['server.mjs'], tools: { recall: { sideEffect: 'none' } } }]));

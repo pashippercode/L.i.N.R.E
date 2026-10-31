@@ -177,7 +177,12 @@ Plugin <id> requires Irmia <要求>; current version is <当前>
 
 ## 5. 整包哈希与状态机
 
-**哈希怎么算**：`sha256`，把包内**全部文件**按相对路径排序（`localeCompare` 升序），逐个 `update(相对路径)` + `update('\0')` + `update(文件字节)`，输出 64 位小写 hex。改任何一个字节 ⇒ 换哈希。
+**哈希怎么算**：`sha256`，把包内**全部文件**按相对路径的**码点序**排序，逐个 `update(相对路径)` + `update('\0')` + `update(文件字节)`，输出 64 位小写 hex。改任何一个字节 ⇒ 换哈希。
+
+两个容易踩的点：
+
+- **排序必须是码点序**（`a < b`），不是 `localeCompare`：后者随 locale 与 Node/ICU 版本变，同一只包在不同机器上会算出不同哈希，已信任的包会被打成 `invalid`。
+- **哈希只含路径与内容字节，不含文件权限位**：Linux 上 `chmod +x` 不改变哈希（Windows 本来也没这层）。
 
 自己算一遍（装之前核对用）：
 
@@ -196,7 +201,7 @@ const walk = (dir) => {
   }
 };
 walk(root);
-files.sort((a, b) => a.localeCompare(b));
+files.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)); // 码点序：别用 localeCompare，排序会影响哈希
 const h = createHash('sha256');
 for (const rel of files) { h.update(rel); h.update('\0'); h.update(readFileSync(join(root, rel))); }
 console.log(h.digest('hex'));

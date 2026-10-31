@@ -16,16 +16,31 @@ export interface PluginPackage {
 
 interface ScannedFile { absolute: string; relative: string; bytes: Buffer }
 
+/** 只带 stat 的同一遍目录扫描结果：算哈希要字节，校验缓存只要它。 */
+interface FileStat { absolute: string; relative: string; size: number; mtimeMs: number; ctimeMs: number }
+
+/**
+ * 文本排序一律按**码点**比较，不用 `localeCompare`。
+ *
+ * 为什么：ICU collation 的规则随 locale 与 Node/ICU 版本变化（`Z` 与 `a`，码点是 Z 在前，
+ * en 排序是 a 在前）。整包哈希依赖文件顺序 ⇒ 换机器或换 Node 版本可能算出不同哈希 ⇒
+ * 已信任的包被判 invalid。哈希的输入必须和运行环境无关。
+ */
+export function compareCodePoint(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 export function pluginPackagesRoot(dataDir: string): string {
   return join(dataDir, 'plugins', 'packages');
 }
 
-function scanFiles(rootDir: string): ScannedFile[] {
+/** 扫一遍目录：只 stat、不读内容，顺带把符号链接/非常规文件/体积上限判掉。 */
+function collectStats(rootDir: string): FileStat[] {
   const root = realpathSync(rootDir);
-  const files: ScannedFile[] = [];
+  const files: FileStat[] = [];
   let totalBytes = 0;
   function walk(dir: string): void {
-    const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => compareCodePoint(a.name, b.name));
     for (const entry of entries) {
       const absolute = join(dir, entry.name);
       const stat = lstatSync(absolute);
@@ -39,17 +54,45 @@ function scanFiles(rootDir: string): ScannedFile[] {
       totalBytes += stat.size;
       if (totalBytes > PLUGIN_FILE_LIMITS.maxTotalBytes) throw new Error(`Plugin total size exceeds ${PLUGIN_FILE_LIMITS.maxTotalBytes}`);
       if (files.length >= PLUGIN_FILE_LIMITS.maxFiles) throw new Error(`Plugin file count exceeds ${PLUGIN_FILE_LIMITS.maxFiles}`);
-      const relativePath = relative(root, absolute).split(sep).join('/');
-      files.push({ absolute, relative: relativePath, bytes: readFileSync(absolute) });
+      files.push({ absolute, relative: relative(root, absolute).split(sep).join('/'), size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs });
     }
   }
   walk(root);
   return files;
 }
 
+function fingerprintOf(stats: readonly FileStat[]): string {
+  const hash = createHash('sha256');
+  for (const file of [...stats].sort((a, b) => compareCodePoint(a.relative, b.relative))) {
+    // 折进 ctime：`utimes` 能把 mtime 还原成原值，ctime 由内核在内容/元数据每次变更时重写，
+    // 用户态没有还原它的接口。于是「保留 size 与 mtime 改写内容」这种篡改在指纹上就会现形，
+    // 而指纹仍然只 stat、不读一个字节。
+    hash.update(`${file.relative}\0${file.size}\0${file.mtimeMs}\0${file.ctimeMs}\n`);
+  }
+  return hash.digest('hex');
+}
+
+/**
+ * 整包缓存指纹：**只 stat，不读字节**。
+ *
+ * 用途是让 `list()` 判断「这包跟上次扫的是不是同一份」。隔离期的包每秒被问一次，
+ * 真去读 8 MB 再算一遍 SHA256 就是白烧 IO；改任一文件的内容、大小或时间都会让指纹变。
+ *
+ * **它只是缓存失效判据，不是内容完整性凭据**：指纹由元数据算出来，而元数据不是内容的
+ * 函数（同一份元数据对应得了两份不同的字节）。凡是「这个包的声明要变成运行面」的入口
+ * （`PluginManager` 的确认/启停/隔离/装配）都必须用 `scanPluginPackage` 重算字节哈希。
+ */
+export function pluginPackageFingerprint(rootDir: string): string {
+  return fingerprintOf(collectStats(rootDir));
+}
+
+function scanFiles(rootDir: string): ScannedFile[] {
+  return collectStats(rootDir).map((file) => ({ absolute: file.absolute, relative: file.relative, bytes: readFileSync(file.absolute) }));
+}
+
 function hashFiles(files: readonly ScannedFile[]): string {
   const hash = createHash('sha256');
-  for (const file of [...files].sort((a, b) => a.relative.localeCompare(b.relative))) {
+  for (const file of [...files].sort((a, b) => compareCodePoint(a.relative, b.relative))) {
     hash.update(file.relative);
     hash.update('\0');
     hash.update(file.bytes);

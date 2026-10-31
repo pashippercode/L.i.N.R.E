@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test, { describe } from 'node:test';
 
@@ -153,5 +154,32 @@ describe('不可变插件包', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'plugin.json'), JSON.stringify(manifest()));
     assert.throws(() => installPluginPackage(dir, dataDir), /inside|destination|recursive/i);
+  });
+});
+
+describe('整包哈希的确定性', () => {
+  test('按码点排序，不受 locale/ICU 影响', () => {
+    const dir = tempDirSync('irmia-plugin-order-');
+    writeFileSync(join(dir, 'plugin.json'), JSON.stringify(manifest({ contributions: { skills: [] }, permissions: [] })));
+    writeFileSync(join(dir, 'Zeta.md'), 'Z');
+    writeFileSync(join(dir, 'alpha.md'), 'A');
+    const paths = ['Zeta.md', 'alpha.md', 'plugin.json'];
+    const codepoint = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+    const digest = (order: string[]): string => {
+      const hash = createHash('sha256');
+      for (const rel of order) {
+        hash.update(rel);
+        hash.update('\u0000');
+        hash.update(readFileSync(join(dir, rel)));
+      }
+      return hash.digest('hex');
+    };
+    const expected = digest([...paths].sort(codepoint));
+    assert.equal(scanPluginPackage(dir).contentHash, expected);
+
+    // 反向断言：这条用例真的在盯顺序——若两序一致，说明样本没区分力，直接失败提醒换样本
+    const localeOrder = [...paths].sort((a, b) => a.localeCompare(b));
+    assert.notEqual(localeOrder.join('|'), [...paths].sort(codepoint).join('|'), '样本需能区分码点序与 locale 序');
+    assert.notEqual(digest(localeOrder), expected, 'locale 序算出的哈希必须不同');
   });
 });

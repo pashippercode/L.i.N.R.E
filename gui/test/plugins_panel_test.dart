@@ -19,7 +19,7 @@ class _FakeApi extends IrmiaApi {
   Completer<dynamic>? postPending;
 
   @override
-  Future<dynamic> get(String path) async {
+  Future<dynamic> get(String path, {Duration? timeout}) async {
     if (path == '/api/plugins') {
       if (pluginsError != null) throw pluginsError!;
       if (pluginsPending != null) return pluginsPending!.future;
@@ -28,7 +28,7 @@ class _FakeApi extends IrmiaApi {
   }
 
   @override
-  Future<dynamic> post(String path, Map<String, dynamic> body, {String? confirm}) async {
+  Future<dynamic> post(String path, Map<String, dynamic> body, {String? confirm, Duration? timeout}) async {
     posts.add((path: path, body: body, confirm: confirm));
     if (postPending != null) return postPending!.future;
     return postReplies[path] ?? {'ok': true};

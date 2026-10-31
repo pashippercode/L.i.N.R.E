@@ -92,7 +92,7 @@ export const ASSET_NOTE_CHARS_MAX = 60;
 /**
  * **指路那一截**（路径一类）的长度上限：给得比说明宽。
  *
- * 为什么不能都用 60：`已在 PATH（D:\IrmiaAgent\tools\ffmpeg\ffmpeg-8.1.1-essentials_build\bin\ffmpeg.exe）`
+ * 为什么不能都用 60：`已在 PATH（<安装根>\tools\ffmpeg\ffmpeg-8.1.1-essentials_build\bin\ffmpeg.exe）`
  * 是**一条指路**，而 Windows 上一条真路径很容易过 60 字符。指路被切成
  * `…essentials_build\…` 就**指不到任何文件**了——那不是省 token，是把这一格弄坏
  * （用户 2026-10-07 点名的正是这条：`已在 PATH → …` / `路径：…` 这一类别跟着说明一起截）。
@@ -657,7 +657,7 @@ export function clipAssetNote(text: string, max = ASSET_NOTE_CHARS_MAX): string 
  *
  * 为什么判据收得这么紧（**别放宽**）：只要一段**话**里出现过路径就给它 120 字符的额度，
  * 等于让"命令 + 细节"从这条路绕回来——实测那条 335 字符的说明里就有
- * `"<repo>\skills\anysearch\scripts\anysearch_cli.ps1"`。
+ * `"<仓库>\skills\anysearch\scripts\anysearch_cli.ps1"`。
  * 判据一宽，最该被截的那一类恰好豁免，这一版就白改了。
  * 反过来，真路径里极少带空格（带空格的那些本来就该用引号，展示层不负责解引用）。
  */
@@ -936,9 +936,15 @@ function descClauseOf(server: McpIndexServerFacts): string {
  *   ③ **一个工具名都不许出现**：这一段回答"有哪些 server"，工具清单按需（`mcp` 工具）。
  *      往这里加工具名等于把披露式入口的价值整个抹掉（v43 那一版的红线）。
  *
- * `servers` 为空 ⇒ `text` 是空串（渲染层整段不出现）。**注意**：调用方（`real-loop` 的
- * `mcpIndexSync`）在空串时**不写快照事件**——"没有 server"这件事不需要一条事件来记，
- * 而写了它反而会让 `heartbeat-real-wake` 那类"事件序列逐字相同"的基线无故多一条。
+ * `servers` 为空 ⇒ `text` 是空串（渲染层整段不出现）。**注意**调用方（`real-loop` 的
+ * `mcpIndexSync`）对这份空串怎么落库：分两种形状，别把两者混成一句"空索引不写事件"。
+ *   • **从来没有过快照**（`point.seq === 0`）：**不写**。"空快照"与"没有快照"在渲染上
+ *     逐字节等价，写了只会在事件流里多一行没人读的东西、让 `heartbeat-real-wake` 那类
+ *     "事件序列逐字相同"的基线无故多一条。
+ *   • **从非空变空**：**必须写**一条 `text: ''` 的快照（墓碑）。不写的话，重建（`replay`
+ *     的 `mcpIndexOf`）读到的是上一条非空快照 ⇒ 实时请求里已经没有的 server 在重建里又
+ *     冒出来，"同一份日志重建同一份请求"当场作废。写完墓碑之后下一拍 `point.text === ''`
+ *     ⇒ 不会再写，不每拍刷事件。
  */
 export function mcpIndexView(
   servers: readonly McpServerEntry[],

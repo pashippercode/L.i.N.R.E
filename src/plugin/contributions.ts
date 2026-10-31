@@ -27,15 +27,27 @@ export function composePluginHooks(packages: readonly PluginPackage[]): { entrie
     const declaration = pkg.manifest.contributions.hooks;
     if (declaration === undefined) continue;
     const loaded = loadHookConfig(join(pkg.rootDir, declaration));
+    // 声明的文件读不到是**配置错误**，不是「没配钩子」：loadHookConfig 对缺文件返回
+    // exists: false 且不给 problem（那条语义要留给内置的可选配置，改它会误报），插件侧
+    // 必须自己补一条，否则显式声明的钩子会静默消失，只剩「明明写了却没生效」的现象。
+    if (!loaded.exists) warnings.push(`${pkg.manifest.id}: 插件显式声明的 Hook 文件不存在或不可读：${declaration}`);
     warnings.push(...loaded.problems.map((problem) => `${pkg.manifest.id}: ${problem}`));
-    for (const entry of loaded.entries) {
+    loaded.entries.forEach((entry, index) => {
+      // 停用条目留在声明里但不装配：与内置 Hook 的 enabled 语义（见 main.ts 装配处）一致
+      if (entry.enabled === false) return;
       const cwd = entry.cwd === undefined ? pkg.rootDir : resolve(pkg.rootDir, entry.cwd);
       if (!inside(pkg.rootDir, cwd)) {
         warnings.push(`${pkg.manifest.id}: Hook cwd escapes the package: ${entry.cwd}`);
-        continue;
+        return;
       }
-      entries.push({ ...entry, cwd, plugin: { id: pkg.manifest.id, contentHash: pkg.contentHash, contributionName: `${entry.hook}:${entry.matcher}` } });
-    }
+      // 身份必须唯一到「一条声明」：同一个 hook+matcher 可以合法地出现多条（同一执行点挂
+      // 两条不同 command 的钩子）。只用 `hook:matcher` 会让它们共享熔断计数与探针身份——
+      // 一条坏掉进隔离后，另一条健康的一次成功就能把整包「恢复」。序号取本条在已解析条目里
+      // 的位置（与文件顺序一致），并且在 `enabled: false` 过滤**之前**就定下来——否则把邻居
+      // 停用一下就会改掉这一条的身份，刚隔离的贡献立刻对不上号。包由内容哈希寻址、不可变，
+      // 所以序号对同一份包恒定。
+      entries.push({ ...entry, cwd, plugin: { id: pkg.manifest.id, contentHash: pkg.contentHash, contributionName: `${entry.hook}:${entry.matcher}#${index}` } });
+    });
   }
   return { entries, warnings };
 }
