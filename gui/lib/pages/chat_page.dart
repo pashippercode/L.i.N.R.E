@@ -456,6 +456,10 @@ class ChatPageState extends State<ChatPage> {
   /// 几小时才动一次。进页面取一次 + 断线恢复时补一次就够了（见 [_loadContacts]）。
   Map<String, String> _contacts = const {};
 
+  /// 她写下的会话别名（`aliases.md` 的 sid 段，`GET /api/sessions` 的 `aliases`）。
+  /// 名字优先级：用户填的 > 她记的 > 未命名（与后端 `resolveSessionName` 同序）。
+  Map<String, String> _aliases = const {};
+
   /// 别名表**取到过没有**。空表有两种（"人还没起过名字"和"这次没读到"），
   /// 前者要显示「未命名会话」、后者要重试——用长度分辨不出来。
   bool _contactsLoaded = false;
@@ -852,6 +856,7 @@ class ChatPageState extends State<ChatPage> {
     try {
       final data = await widget.state.api.get('/api/sessions');
       final raw = data is Map ? data['contacts'] : null;
+      final rawAliases = data is Map ? data['aliases'] : null;
       if (!mounted) return;
       setState(() {
         // 非对象一律当"没读到"：一个畸形的返回不该把已经显示出来的名字抹掉
@@ -859,6 +864,9 @@ class ChatPageState extends State<ChatPage> {
           _contacts = {
             for (final entry in raw.entries) '${entry.key}': '${entry.value}',
           };
+          _aliases = rawAliases is Map
+              ? {for (final entry in rawAliases.entries) '${entry.key}': '${entry.value}'}
+              : const {};
           _contactsLoaded = true;
         }
       });
@@ -877,7 +885,11 @@ class ChatPageState extends State<ChatPage> {
     if (sid == null) return kUnnamedSender;
     // 新旧两种写法都试（与后端 `sidLookupKeys` 同口径）：联系人表里可能还留着归一之前的
     // `qq:group-at:<群id>`——只查一种写法，群聊就会显示「未命名会话」（实测撞到过两次）
-    final name = _contacts[sid] ?? _contacts[_legacySidOf(sid)];
+    final legacy = _legacySidOf(sid);
+    final name = _contacts[sid] ??
+        _contacts[legacy] ??
+        _aliases[sid] ??
+        _aliases[legacy];
     return name == null || name.isEmpty ? kUnnamedSender : name;
   }
 

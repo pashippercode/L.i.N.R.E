@@ -406,6 +406,12 @@ export class AuthStore {
 
     const salt = randomBytes(SCRYPT_SALT_BYTES);
     const derived = await scryptAsync(password, salt, SCRYPT_PARAMS);
+    if (this.file !== null) {
+      return {
+        ok: false, status: 409, code: 'already-initialized',
+        message: '这台实例已经设过密码了。忘记密码的处理办法：删掉 data/.auth.json 后重启进程，再设一次。',
+      };
+    }
     this.file = {
       v: 1,
       scrypt: { salt: salt.toString('hex'), ...SCRYPT_PARAMS },
@@ -440,6 +446,9 @@ export class AuthStore {
 
     const params = file.scrypt;
     const derived = await scryptAsync(password, Buffer.from(params.salt, 'hex'), params);
+    if (this.file !== file) {
+      return { ok: false, status: 401, code: 'bad-password', message: '密码不对。' };
+    }
     if (!equalHex(derived.toString('hex'), file.hash)) {
       this.noteFailure();
       const next = this.backoffMs();
@@ -490,6 +499,9 @@ export class AuthStore {
 
     const params = file.scrypt;
     const derived = await scryptAsync(oldPassword, Buffer.from(params.salt, 'hex'), params);
+    if (this.file !== file) {
+      return { ok: false, status: 401, code: 'bad-password', message: '当前密码不对。' };
+    }
     if (!equalHex(derived.toString('hex'), file.hash)) {
       this.noteFailure();
       return { ok: false, status: 401, code: 'bad-password', message: '当前密码不对。' };
@@ -499,6 +511,9 @@ export class AuthStore {
 
     const salt = randomBytes(SCRYPT_SALT_BYTES);
     const next = await scryptAsync(newPassword, salt, SCRYPT_PARAMS);
+    if (this.file !== file) {
+      return { ok: false, status: 401, code: 'bad-password', message: '当前密码不对。' };
+    }
     const revoked = file.sessions.length;
     this.file = {
       v: 1,

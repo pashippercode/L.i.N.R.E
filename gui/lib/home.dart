@@ -289,6 +289,7 @@ class _MoreGroupState extends State<_MoreGroup> {
                   children: [
                     for (final page in morePages)
                       _NavItem(
+                        key: ValueKey('nav-${page.id}'),
                         icon: page.icon,
                         activeIcon: page.activeIcon,
                         label: page.label,

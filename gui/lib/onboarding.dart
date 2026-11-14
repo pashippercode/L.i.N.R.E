@@ -87,6 +87,15 @@ import 'ui_state.dart';
 /// 「引导已经出现过」这个事实的存放键（`ui-state.json`）
 const kOnboardingDoneFlag = 'onboarding-done';
 
+/// 把作用域钉成确定值（`''` = 旧行为，只用 `onboarding-done`）。
+String? onboardingFlagScopeOverride;
+
+/// 「引导问过了」这个标志的键：一台实例一份（后缀是她的数据目录）。
+String onboardingFlagKeyOf(AppState state) {
+  final scope = (onboardingFlagScopeOverride ?? state.knownDataDir).trim();
+  return scope.isEmpty ? kOnboardingDoneFlag : '$kOnboardingDoneFlag@$scope';
+}
+
 /// 允许强制弹出引导（排障与人工验证用；正式运行不要设）。
 ///
 /// 为什么留这个口子：判据读的是服务端现状——在一台**已经配好**的机器上（比如用户的开发机），
@@ -594,7 +603,7 @@ class _OnboardingHostState extends State<OnboardingHost> {
     // 三态：false = 没问过（文件不在也算这一档：真·首次安装）；true = 问过；
     // null = 记录坏了。未知按"不弹"处理——手动通道（首页「配置引导」）照样能开，
     // 见 [_openManually]。
-    final askedBefore = await loadFlag(kOnboardingDoneFlag);
+    final askedBefore = await loadFlag(onboardingFlagKeyOf(widget.state));
     if (!mounted) return;
     final force = Platform.environment[kForceOnboardingEnv];
     // 强制口子下不必读现状：它要答的问题是"这张卡长什么样、四步走得通吗"，
@@ -629,7 +638,7 @@ class _OnboardingHostState extends State<OnboardingHost> {
         fromFirstRun: fromFirstRun,
       );
       // 只有"首次那条路"才写「问过了」：手动打开不动它（见 [_openManually]）
-      if (fromFirstRun) await saveFlag(kOnboardingDoneFlag, true);
+      if (fromFirstRun) await saveFlag(onboardingFlagKeyOf(widget.state), true);
       if (!mounted) return;
       final strings = IrmiaStrings.read(context);
       IrmiaToast.show(

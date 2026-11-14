@@ -1959,7 +1959,7 @@ class AppState extends ChangeNotifier {
         pickerProblem = InstanceGateProblem.noLauncher;
         return;
       }
-      final port = await instances.freePort(kFirstInstancePort, '127.0.0.1');
+      final port = await instances.freePort(kFirstSpawnedInstancePort, '127.0.0.1');
       if (port == null) {
         pickerProblem = InstanceGateProblem.portUnavailable;
         return;

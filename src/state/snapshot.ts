@@ -212,8 +212,8 @@ async function readSnapshotFile(
   if (!isRecord(parsed)) return { ok: false, reason: `${file} 顶层不是 JSON 对象` };
 
   const rawVersion = parsed['version'];
-  if (rawVersion !== undefined && rawVersion !== SNAPSHOT_VERSION) {
-    return { ok: false, reason: `${file} 的版本 ${String(rawVersion)} 不认识` };
+  if (rawVersion !== SNAPSHOT_VERSION) {
+    return { ok: false, reason: `${file} 的版本 ${String(rawVersion)} 不认识（缺失或过期）` };
   }
 
   const upToSeq = parsed['upToSeq'];

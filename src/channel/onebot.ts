@@ -1057,6 +1057,7 @@ export class OneBotClient {
   private client: WsClient | null = null;
   private started = false;
   private stopping = false;
+  private generation = 0;
   private ready = false;
 
   private selfId = '';
@@ -1146,10 +1147,11 @@ export class OneBotClient {
     if (this.started) return;
     this.started = true;
     this.stopping = false;
-    void this.openOnce();
+    void this.openOnce(++this.generation);
   }
 
   stop(): void {
+    this.generation++;
     this.stopping = true;
     this.started = false;
     if (this.reconnectTimer !== null) {
@@ -1211,8 +1213,8 @@ export class OneBotClient {
     return { wsUrl: this.options.wsUrl, accessToken: this.options.accessToken ?? '' };
   }
 
-  private async openOnce(): Promise<void> {
-    if (this.stopping) return;
+  private async openOnce(generation = this.generation): Promise<void> {
+    if (this.stopping || generation !== this.generation) return;
     let url: string;
     try {
       const target = this.targetEndpoint();
@@ -1239,14 +1241,22 @@ export class OneBotClient {
        * 读到的是 null ⇒ 拿配置里那份（没有 token）去连 ⇒ 401；而下一秒重连时重读一次，
        * 那时配置已经在盘上了，token 就跟着上去了。没有这一步，空 token 会被固化到天荒地老。
        */
+      if (this.stopping || generation !== this.generation) return;
       this.endpointMemo?.invalidate();
       this.log.warn(`[OneBot] 连接失败（${maskAccessToken(url)}）：${messageOf(err)}`);
       this.scheduleReconnect();
       return;
     }
 
+    if (this.stopping || generation !== this.generation) {
+      client.close(1000, 'connection superseded');
+      return;
+    }
     this.client = client;
-    client.onMessage((message) => { this.handleIncoming(message.text); });
+    client.onMessage((message) => {
+      if (this.stopping || generation !== this.generation || this.client !== client) return;
+      this.handleIncoming(message.text);
+    });
     client.onError((err) => { this.log.warn(`[OneBot] 传输层错误：${err.message}`); });
     client.onClose((info) => {
       if (this.client !== client) return; // 已被替换（重连/停止）的旧连接，忽略它的收尾
@@ -1278,10 +1288,12 @@ export class OneBotClient {
     const human = delay < 1000 ? `${delay}ms` : `${Math.round(delay / 1000)}s`;
     const maxHuman = max < 1000 ? `${max}ms` : `${Math.round(max / 1000)}s`;
     this.log.warn(`[OneBot] ${human} 后重连（第 ${this.reconnectAttempts} 次，退避上限 ${maxHuman}）`);
+    const generation = this.generation;
     this.reconnectTimer = {
       id: this.timeout(() => {
+        if (this.stopping || generation !== this.generation) return;
         this.reconnectTimer = null;
-        void this.openOnce();
+        void this.openOnce(generation);
       }, delay),
     };
   }
@@ -1468,7 +1480,9 @@ export class OneBotClient {
   private selfIdListener: ((id: string) => void) | null = null;
 
   private async fetchSelfId(): Promise<void> {
+    const generation = this.generation;
     const result = await this.call('get_login_info', {});
+    if (this.stopping || generation !== this.generation) return;
     if (!result.ok) {
       this.log.warn(`[OneBot] get_login_info 未拿到机器人 QQ 号：${result.reason}（群 @ 判定将依赖事件自带的 self_id）`);
       return;

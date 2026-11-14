@@ -295,21 +295,15 @@ class _OverviewPageState extends State<OverviewPage> {
     return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
   }
 
-  /// 建议清单（服务端 `DashboardView.suggestions`，结构见 src/web/server.ts:549）。
+  /// 建议清单：只留死信，其它一律不摆（接上 `_AdviceCard.kDeadLettersId` 判据）。
   List<_Advice> get _advice {
     final out = <_Advice>[];
     final list = stats?['suggestions'];
     if (list is List) {
       for (final s in list.whereType<Map>()) {
         final item = _Advice.from(s);
-        if (item.title.isNotEmpty) out.add(item);
+        if (item.title.isNotEmpty && item.id == _AdviceCard.kDeadLettersId) out.add(item);
       }
-    }
-    if (stats?['personaIsSeed'] == true) {
-      out.add(_Advice(
-        id: 'persona-seed',
-        title: IrmiaStrings.of(context).overviewPersonaSeedAdvice,
-      ));
     }
     return out;
   }

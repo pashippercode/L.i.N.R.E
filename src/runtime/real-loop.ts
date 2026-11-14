@@ -223,6 +223,10 @@ const CATEGORY = {
 
 /** 失败刹车后的半开冷却（毫秒）：冷却期满放行一次试探，避免坏接口被反复打 */
 const DEFAULT_FAIL_COOLDOWN_MS = 30 * 60 * 1000;
+/** 一拍连续无进展多久告警；两倍阈值自动中断当前 turn */
+const DEFAULT_TICK_STUCK_MS = 3 * 60 * 1000;
+/** 哪些事件算“这一拍还在推进” */
+const TICK_PROGRESS_TYPE_RE = /^(?:turn\/start$|step\/|tool\/|message\/|budget\/|model\/|speak\/|compaction\/|image\/)/u;
 /** 单拍最多认领的输入条数（与 M2 一致：一批多条时的边界固定，便于复盘） */
 const BATCH_LIMIT = 8;
 
@@ -1454,6 +1458,8 @@ export interface StopOutcome {
 }
 
 export interface RealLoopDeps {  log: EventLog;
+  /** 一拍连续无进展多久告警（毫秒）；缺省 3 分钟，两倍自动中断 */
+  tickStuckMs?: number;
   dataDir: string;
   projection: Projection;
   now: () => Date;
@@ -1732,6 +1738,13 @@ export class RealLoop {
    */
   private tickSkipped = 0;
   private tickTotal = 0;
+  private readonly tickStuckMs: number;
+  private tickStuckTimer: ReturnType<typeof setTimeout> | null = null;
+  private tickAbortTimer: ReturnType<typeof setTimeout> | null = null;
+  private tickStuckReported = false;
+  private tickLastProgressAt = 0;
+  private tickStartedAt = 0;
+  private tickProgressUnsubscribe: (() => void) | null = null;
   /**
    * **上一轮 turn 的收尾计时**（`agent-loop` 的 `onTurnTiming` 回填，见 BUG-4）。
    *
@@ -2142,6 +2155,7 @@ export class RealLoop {
     this.deps = deps;
     this.write = deps.out ?? ((line) => console.log(line));
     this.pollMs = deps.pollMs ?? 1000;
+    this.tickStuckMs = Math.max(10_000, deps.tickStuckMs ?? DEFAULT_TICK_STUCK_MS);
     this.stallMs = deps.stallMs ?? DEFAULT_STALL_MS;
     this.failCooldownMs = deps.failCooldownMs ?? DEFAULT_FAIL_COOLDOWN_MS;
     this.failStreakMax = deps.config.budget?.failStreakMax ?? 5;
@@ -2203,6 +2217,11 @@ export class RealLoop {
   start(): void {
     if (this.running) return;
     this.running = true;
+    if (this.tickProgressUnsubscribe === null) {
+      this.tickProgressUnsubscribe = this.deps.log.onAppend((event) => {
+        this.noteTickProgress(event.type);
+      });
+    }
     void this.ensureReady();
     this.timer = setInterval(() => {
       void this.tick().catch((err) => {
@@ -2667,6 +2686,11 @@ export class RealLoop {
   async stop(): Promise<void> {
     this.running = false;
     this.wakeChannelData = null;
+    this.disarmTickWatchdog();
+    if (this.tickProgressUnsubscribe !== null) {
+      try { this.tickProgressUnsubscribe(); } catch { }
+      this.tickProgressUnsubscribe = null;
+    }
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.heartbeatSource.stop();
@@ -2856,6 +2880,14 @@ export class RealLoop {
         this.lastTurnMs = Date.now() - turnStartedAt;
       }
       this.write(`[循环] turn 结束：${reason.kind}`);
+      if (reason.kind === 'error' && /(?:402|insufficient[ _]?balance)/iu.test(reason.message)) {
+        void this.notifier.alert({
+          category: 'model-balance',
+          level: 'warn',
+          title: '模型余额不足',
+          body: '服务端返回 402（Insufficient Balance）：充值后她会自动恢复；在此期间发来的消息会重试两次后进死信。',
+        }).catch(() => undefined);
+      }
       // 压缩之后**叫醒她一次**（`wake/manual` · `via: 'compact'`，2026-10-09）：压完不叫，
       // 那份交接笔记要等到下一次有人说话才被看见，而"手上没做完的事"就是在这段时间里断掉的。
       // 放在 turn 结束之后、**且不 return**：它是把一条输入放进队列（下一拍起 turn），
@@ -2922,6 +2954,79 @@ export class RealLoop {
    * 必然恒为 1，所以有信息量的是"这一慢拍压掉了几拍"——它正是重叠发生过的证据。
    * 写成 internal 而不是 model 是刻意的：它是**框架的账**，不是对她说的话。
    */
+  private noteTickProgress(type: string): void {
+    if (!this.tickInFlight) return;
+    if (!TICK_PROGRESS_TYPE_RE.test(type)) return;
+    this.tickLastProgressAt = Date.now();
+    this.tickStuckReported = false;
+    this.armTickWatchdog();
+  }
+
+  private disarmTickWatchdog(): void {
+    if (this.tickStuckTimer !== null) {
+      clearTimeout(this.tickStuckTimer);
+      this.tickStuckTimer = null;
+    }
+    if (this.tickAbortTimer !== null) {
+      clearTimeout(this.tickAbortTimer);
+      this.tickAbortTimer = null;
+    }
+  }
+
+  private armTickWatchdog(): void {
+    this.disarmTickWatchdog();
+    if (!this.tickInFlight) return;
+    const idle = Math.max(0, Date.now() - this.tickLastProgressAt);
+    const alertIn = Math.max(0, this.tickStuckMs - idle);
+    const abortIn = Math.max(0, this.tickStuckMs * 2 - idle);
+    this.tickStuckTimer = setTimeout(() => {
+      if (!this.tickInFlight) return;
+      const idleNow = Date.now() - this.tickLastProgressAt;
+      if (idleNow < this.tickStuckMs) {
+        this.armTickWatchdog();
+        return;
+      }
+      if (this.tickStuckReported) return;
+      this.tickStuckReported = true;
+      const total = Math.round((Date.now() - this.tickStartedAt) / 1000);
+      const waited = Math.round(idleNow / 1000);
+      this.write(`[循环] 连续 ${waited} 秒没有进展（整拍已 ${total} 秒）`);
+      void this.notifier.alert({
+        category: 'tick-stuck',
+        level: 'warn',
+        title: `循环一拍连续 ${Math.round(this.tickStuckMs / 60_000)} 分钟没有进展`,
+        body: `这一拍已经连续 ${waited} 秒没有新的 step/tool/模型输出（整拍 ${total} 秒）。`
+          + '她的消息会一直排在队列里。恢复靠传输层超时；长时间不恢复就重启后端。',
+        params: { thresholdMs: this.tickStuckMs },
+      }).catch(() => undefined);
+    }, alertIn);
+    this.tickStuckTimer.unref?.();
+    this.tickAbortTimer = setTimeout(() => {
+      if (!this.tickInFlight) return;
+      const idleNow = Date.now() - this.tickLastProgressAt;
+      if (idleNow < this.tickStuckMs * 2) {
+        this.armTickWatchdog();
+        return;
+      }
+      if (!this.busy || this.stopController.signal.aborted) return;
+      const total = Math.round((Date.now() - this.tickStartedAt) / 1000);
+      const waited = Math.round(idleNow / 1000);
+      this.write(`[循环] 连续 ${waited} 秒没有进展（整拍已 ${total} 秒）：自动中断当前 turn`);
+      this.stoppedByOwner = false;
+      this.stopController.abort(new Error('看门狗：turn 连续无进展超时'));
+      this.stopController = new AbortController();
+      void this.notifier.alert({
+        category: 'tick-stuck',
+        level: 'warn',
+        title: `循环一拍连续 ${Math.round((this.tickStuckMs * 2) / 60_000)} 分钟没有进展，已自动中断`,
+        body: `这一拍已经连续 ${waited} 秒没有新的 step/tool/模型输出，看门狗已 abort 当前 turn。`
+          + '输入会按 aborted 语义处理；若仍不恢复，再重启后端。',
+        params: { thresholdMs: this.tickStuckMs * 2 },
+      }).catch(() => undefined);
+    }, abortIn);
+    this.tickAbortTimer.unref?.();
+  }
+
   private async tick(): Promise<void> {
     this.tickTotal += 1;
     if (this.tickTotal % 20 === 0) {
@@ -2936,6 +3041,10 @@ export class RealLoop {
     }
     this.tickInFlight = true;
     const startedAt = Date.now();
+    this.tickStartedAt = startedAt;
+    this.tickLastProgressAt = startedAt;
+    this.tickStuckReported = false;
+    this.armTickWatchdog();
     const completion = this.tickOnce();
     this.tickCompletion = completion;
     try {
@@ -2945,6 +3054,7 @@ export class RealLoop {
       // try/finally：`tickOnce` 抛错也一定复位，否则一次异常就把循环永久锁死
       // （外层 `start()` 的 `.catch` 只管报错，不会复位任何标志）。
       this.tickInFlight = false;
+      this.disarmTickWatchdog();
       const elapsedMs = Date.now() - startedAt;
       const skipped = this.tickSkipped;
       this.tickSkipped = 0;
