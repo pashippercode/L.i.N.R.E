@@ -564,7 +564,10 @@ describe('维护窗口 · 常驻规则与信号同源（用户点名要的那条
     // 两个参数描述（页大小逐字在里面），`instructions` 一个字节没改；换代照旧递增。
     // ——当前这一代就是它。换代之后这个数要一起改，而**改它的理由必须是"换了一代"**——
     // 所以断言里那句理由写成"当前这一代就是它"，免得下一个人把它读成"这句话只许属于 51"。
-    assert.equal(RENDER_VERSION, '88', '模板换代就必须递增：一次设计内的全 miss');
+    // v90（2026-11-22）：重复的 `tool_call_id` 在渲染侧加序号去重（见 `render.ts` 文件头 v90 篇）。
+    // 这一笔动的是 `function_call` / `function_call_output` 那一对 item 的 id，**`instructions`
+    // 一个字节没改**（这一条锁的就是那句话）；换代照旧递增。
+    assert.equal(RENDER_VERSION, '90', '模板换代就必须递增：一次设计内的全 miss');
     const rendered = render(renderInput());
     // v61：装置自述**逐字置换**后，这一句的落点从旧的 ⑦ 段容器搬进新稿的 §6（口径不变、措辞是
     // 用户的原文）⇒ 这条按新正文重锚，**不是放宽**：它照样要求"这一口径真的进 instructions"。

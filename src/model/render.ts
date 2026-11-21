@@ -2133,7 +2133,19 @@ import { estimateTokens } from '../tools/registry.ts';
 //      在框外印（框里是"别人说的话"，名单是框架给的查询结果），并写明"填进 speak 正文的哪里"。
 //
 //      请求体为什么变：**参数进 `tools` 那段**（缓存前缀）。加一个参数就是加字节 ⇒ 必须递增。
-export const RENDER_VERSION = '88';
+//
+// v90（**重复的 `tool_call_id` 加序号去重**，2026-11-22）：模型在同一个 turn 里会把同一个
+//      `call_id` 发多次（实测 turn 3426：step 5/10 同是 `call_1c1a797d63390afdb8bd1e57`，
+//      step 15/16/19 同是 `call_c595353a3755177c338a43cc`，两组的 arguments 各自逐字节相同）。
+//      日志是既成事实（铁律 2 不许回头改），但服务端硬规则是**一次请求里 `call_id` 唯一**
+//      （Chat 与 Responses 同一条）。不修的代价：那份历史留在可见区 ⇒ **此后每一轮**
+//      都被 400 拒（实测 `Prefill server error … Duplicate value for 'tool_call_id'`），
+//      而 400 属 `invalid`（`retryable === false`）⇒ 重试与改道都救不回来，她永久说不了话。
+//      改法：渲染这一侧给重复出现的第 2、3… 次加确定性后缀 `#N`，`function_call` 与它的
+//      `function_call_output` 同步改名（配对键改用 `tool/result.callSeq`——精确指向那一次调用）。
+//      **未受影响的日志逐字节不变**（第一次出现保持原 id），所以不是"人人换版"，但请求体
+//      形状确实变了 ⇒ 照例递增一次版本号。
+export const RENDER_VERSION = '90';
 
 // ──────────────── MCP 常驻索引那一段：唯一来源是日志里的快照（v46） ────────────────
 
@@ -5851,9 +5863,37 @@ function renderEvents(
 
   // 工具调用按 (turn, step, callId) 配对：call 渲染为 function_call，
   // result 渲染为紧随的 function_call_output；组内顺序等于原始调用顺序（seq 升序）。
+  //
+  // **v90：同一次请求里 `call_id` 必须唯一**（服务端硬规则，Chat 与 Responses 同一条）。
+  // 模型在同一个 turn 里**会**把同一个 `call_id` 发多次：实测 turn 3426 的 step 5 与 step 10
+  // 都是 `call_1c1a797d63390afdb8bd1e57`（`todo`，arguments 逐字节相同），step 15/16/19 三次
+  // 都是 `call_c595353a3755177c338a43cc`（`speak`，同样逐字节相同）。
+  //
+  // 那份历史是**已经写下的日志**——铁律 2（历史只可遮蔽、不可改写）不许回头改它，于是只能在
+  // 渲染这一侧让它们互不相同。不修的代价是致命的：请求里重复的 `tool_call_id` 让**此后每一轮**
+  // 都被拒（实测原文 `Prefill server error (400 Bad Request): Duplicate value for
+  // 'tool_call_id' of call_1c1a797d63390afdb8bd1e57 in message[15]`），她等于永久说不了话——
+  // 而且因为它是 400/invalid（`retryable === false`），重试与改道都救不回来。
+  //
+  // 配对键用 `tool/result.callSeq`（精确指向那一次 `tool/call` 的 seq）：`callId` 一旦重复，
+  // 光凭它就分不清这条回执属于哪一次调用。老日志缺 `callSeq` 时退回按 `callId` 找。
+  /** `tool/call` 事件的 seq → 渲染用的 call_id（重复出现的第 2、3… 次带 `#N` 后缀） */
+  const renderedCallId = new Map<number, string>();
   const resultByCallId = new Map<string, AppEvent & { type: 'tool/result' }>();
-  for (const e of visible) {
-    if (e.type === 'tool/result') resultByCallId.set(e.data.callId, e);
+  {
+    const seen = new Map<string, number>();
+    for (const e of visible) {
+      if (e.type !== 'tool/call') continue;
+      const nth = (seen.get(e.data.callId) ?? 0) + 1;
+      seen.set(e.data.callId, nth);
+      // 第一次出现保持原样（**未受影响的日志逐字节不变**）；之后的确定性加序号。
+      renderedCallId.set(e.seq, nth === 1 ? e.data.callId : `${e.data.callId}#${nth}`);
+    }
+    for (const e of visible) {
+      if (e.type !== 'tool/result') continue;
+      const id = renderedCallId.get(e.data.callSeq) ?? e.data.callId;
+      resultByCallId.set(id, e);
+    }
   }
 
   /**
@@ -5983,11 +6023,14 @@ function renderEvents(
         const group = current ?? openGroup(null, true);
         // 正文在 function_call **之前**（canonical 顺序）；没有配对 reasoning 的那一组，正文在这里被丢。
         flushMessage(group);
+        // v90：重复的 `call_id` 在这一侧加序号（见上面 `renderedCallId` 那一段）——
+        // 发出去的每一条 `function_call` / `function_call_output` 必须成对且 id 唯一。
+        const callId = renderedCallId.get(e.seq) ?? e.data.callId;
         push({
           type: 'function_call',
-          call_id: e.data.callId, name: e.data.name, arguments: e.data.arguments,
+          call_id: callId, name: e.data.name, arguments: e.data.arguments,
         }, group);
-        const result = resultByCallId.get(e.data.callId);
+        const result = resultByCallId.get(callId);
         // **配对完整性是硬要求**（见文件头第 4 条）：只有 `function_call` 而没有
         // `function_call_output` 的请求会被服务端直接拒掉（实测原文：
         // `No tool output found for tool call …`，400 invalid_request_error），
@@ -6000,7 +6043,7 @@ function renderEvents(
         // `fc1, fc2, out1, out2`——旧写法"见到一条 call 就 push 它的回执"发成
         // `fc1, out1, fc2, out2`，把区段里的 assistant 段切断（现场 turn 3174.2 / 3049.2）。
         (group.pendingOutputs ??= []).push({
-          type: 'function_call_output', call_id: e.data.callId,
+          type: 'function_call_output', call_id: callId,
           output: result ? renderToolOutput(result, e.data.name) : MISSING_TOOL_OUTPUT,
         });
         break;

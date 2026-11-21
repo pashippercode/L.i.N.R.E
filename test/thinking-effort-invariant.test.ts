@@ -416,6 +416,37 @@ async function driveHeavyLoop(t: TestContext): Promise<DsRequest[]> {
 }
 
 /**
+ * 第三处 `.stream(`：**零字节响应的退避重试**（`zeroByteRetry`）。
+ *
+ * 当刑事由必须是一个 `retryable === true` 且 `kind !== 'empty'` 的错误——`empty` 不被这条
+ * 路径接（空响应有它自己的出口）。这里用 `server`（500），它同时满足两条。
+ *
+ * 钉的仍然是**档位**这件事：重试是**另发一条请求**，那一条也必须是 `heavy/high`——
+ * 一个"重试时悄悄换了档"的实现会让用户在不知情的情况下付更少的钱、拿更差的答案。
+ * 重试策略收成 1 次、退避 0 ms，免得这条用例白等 800ms 的退避。
+ */
+async function driveHeavyZeroByteRetry(t: TestContext): Promise<DsRequest[]> {
+  const harness = await makeLoopHarness(t);
+  const wake = harness.append('wake/manual', { note: '接着干' });
+  const model = fakeHeavyDs([
+    {
+      throws: new DsClientError({
+        kind: 'server',
+        code: 'http_500',
+        message: '服务端 500（可重试）',
+        status: 500,
+      }),
+    },
+    { text: '重试之后接着说。' },
+  ]);
+  await runTurn({
+    ...harness.depsOf(model.ds),
+    modelRetry: { maxAttempts: 1, initialDelayMs: 0, maxDelayMs: 0, failoverAfterAttempts: 50 },
+  }, [wake]);
+  return model.requests;
+}
+
+/**
  * **400 自救那一处**（v73，`runtime/agent-loop.ts` 的 `reasoningEchoFallback`）：第一步先回
  * "reasoning_text 没回传"的 400，第二次（全量重建）成功——两条请求都要是 heavy/high。
  *
@@ -495,9 +526,15 @@ const MODEL_CALL_SITES: ModelCallSite[] = [
     drive: driveHeavyFallback,
     efforts: ['high', 'high'],
   },
+  {
+    source: 'src/runtime/agent-loop.ts',
+    where: 'runtime/agent-loop.ts（零字节响应的退避重试那一处，heavy）',
+    drive: driveHeavyZeroByteRetry,
+    efforts: ['high', 'high'],
+  },
 ];
 
-test('② 五处调用点逐个断言：light 一律 low、heavy 一律 high', async (t) => {
+test('② 六处调用点逐个断言：light 一律 low、heavy 一律 high', async (t) => {
   for (const site of MODEL_CALL_SITES) {
     const requests = await site.drive(t);
     assert.equal(
@@ -558,9 +595,9 @@ test('② 清单是全的：源码里每一处模型调用都有人在表里认�
     ['src/channel/topic.ts', 1],
     ['src/main.ts', 2],
     ['src/persona/memory-maintain.ts', 1],
-    // 2 = 主循环那一处 + v73 的 400 自救那一处（同一个文件、两处 `.stream(`）；
-    // 两处都在下面 `MODEL_CALL_SITES` 里各有一行（各自断言 heavy/high）。
-    ['src/runtime/agent-loop.ts', 2],
+    // 3 = 主循环那一处 + v73 的 400 自救那一处 + 空响应退避重试那一处（同一个文件、
+    // 三处 `.stream(`）；三处都在下面 `MODEL_CALL_SITES` 里各有一行（各自断言 heavy/high）。
+    ['src/runtime/agent-loop.ts', 3],
     ['src/tools/vision.ts', 1],
   ];
 
@@ -606,8 +643,11 @@ test('② 配置面里没有这个旋钮：塞进 config.json 也不生效', asy
     // thinking / reasoning / effort 那三个词），不是思考强度旋钮：
     // 它管"多久没收到数据算卡死"，改它一个字都改不到 `reasoning` 段发出的 `effort`。
     // 这条断言的**实质**（上面那条 `knobPaths` 为空）没有放松，只是列全了 models 这一层的键。
-    ['heavy', 'light', 'requestTimeout'],
-    'models 这一层只有这两档 + 时限那一段（没有思考强度旋钮的家）',
+    // `retry` 同理：它管的是"失败之后等多久再发一次"（`models.retry`，2026-11-21 加），
+    // 字段名里没有 thinking / reasoning / effort，也不是档位——改它一个字都改不到
+    // `reasoning.effort`。上面那条 `knobPaths` 为空的断言（这条测试的**实质**）没有放松。
+    ['heavy', 'light', 'requestTimeout', 'retry'],
+    'models 这一层只有这两档 + 时限/重试那两段（没有思考强度旋钮的家）',
   );
 
   // 人为把"旋钮"写进配置文件：生效配置里一个都不许出现（框架里没有读它的地方）

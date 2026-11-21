@@ -161,9 +161,10 @@ describe('① 全量回传：历史里有几条，请求里就有几条（v73 �
     assert.equal(b, a);
   });
 
-  test('RENDER_VERSION 递到 87', () => {
-    assert.equal(RENDER_VERSION, '88');
-    assert.equal(render(baseInput(logOfSteps(['x']))).context.renderVersion, '88');
+  test('RENDER_VERSION 递到 90', () => {
+    // v90（2026-11-22）：重复的 `tool_call_id` 加序号去重（`render.ts` 文件头 v90 篇）。
+    assert.equal(RENDER_VERSION, '90');
+    assert.equal(render(baseInput(logOfSteps(['x']))).context.renderVersion, '90');
   });
 
   test('缺省口径 = 只按总字符截（300,000）+ 区外照旧全传（用例不另抄一份数）', () => {

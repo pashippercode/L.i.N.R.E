@@ -159,3 +159,87 @@ turn/end  {"kind":"error","code":"http_403",
 - **真机验证**：重启 GUI 之后才能看到横幅本身。
 - **`model/degraded` 仍未接到界面**（LINRE-001 剩下的那一半），改道那一刻还是只有终端日志。
 - **本机 heavy 路由不可用**（另一个问题，不属于本条）：`models.heavy` = `gemini-auto @ http://127.0.0.1:8000/v1`，而 8000 上没有任何监听（绕开 `HTTP_PROXY=127.0.0.1:7890` 直连返回 000）。注意 `curl` 走代理时会拿到一个假的 `502 Bad Gateway`，别拿它当"端点活着但上游挂了"的证据。degenerated 走 `xcmapi.org` 也是 403 insufficient balance（欠费）。当前只有 `light`（yuki）能出话。
+
+## LINRE-004 · 重复的 `tool_call_id` 让她永久说不了话 —— 已解决（2026-11-22）
+
+### 现象
+
+切到 yuki 主路由、重启后端与 GUI 之后，她跑一轮还是不出话。后端事件日志
+（`data/events/000000378473.jsonl`，turn 3565）写的是：
+
+```
+turn/end { kind: 'error', code: 'http_400',
+  message: '请求被拒绝（400）：… 服务端原话：{"error":{"message":"Prefill server error
+    (400 Bad Request): … Duplicate value for 'tool_call_id'
+    of call_1c1a797d63390afdb8bd1e57 in message[15]"}}' }
+```
+
+紧接着 turn 3566 直接 `403 insufficient balance`（改道到了 xcm）。看着像"服务端抽风"，
+其实和网络无关。
+
+### 根因
+
+**模型自己在同一个 turn 里把同一个 `call_id` 发了多次**，我们原样记进了日志；那份历史
+留在可见区，于是**此后每一轮**的请求都带着重复 id 被拒。
+
+真机读数（turn 3426，`data/events/000000350730.jsonl`，20 次工具调用）：
+
+| 步骤 | callId | 工具 | arguments |
+|---|---|---|---|
+| 5 | `call_1c1a797d63390afdb8bd1e57` | `todo` | sha256 `3d7bec04…` |
+| 10 | `call_1c1a797d63390afdb8bd1e57` | `todo` | sha256 `3d7bec04…`（逐字节相同） |
+| 15 / 16 / 19 | `call_c595353a3755177c338a43cc` | `speak` | 三次都是 sha256 `e0e7032b…` |
+
+为什么是"永久"：`400` 属 `invalid` kind ⇒ `retryable === false` ⇒ **不重试**；连"改道"也
+救不了（改道目标是欠费的 xcm）。所以这不是一次失败，是一条把所有后续轮次一起堵死的死路。
+
+### 修复方案
+
+只能改渲染这一侧——**铁律 2（历史只可遮蔽、不可改写）不许回头改日志**，而服务端硬规则是
+"一次请求里 `call_id` 唯一"（Chat 与 Responses 同一条）。
+
+`src/model/render.ts`：
+
+- 新增 `renderedCallId`（`tool/call` 的 seq → 渲染用的 call_id）：同一个 id 第 2、3… 次出现时
+  加确定性后缀 `#N`；**第一次出现保持原样** ⇒ 没受影响的日志逐字节不变；
+- 配对键从 `callId` 换成 **`tool/result.callSeq`**（它精确指向那一次 `tool/call` 的 seq）：
+  `callId` 一重复，光凭它就分不清回执属于哪一次（三条 speak 会全部配到最后一条）。
+  老日志缺 `callSeq` 时退回按 `callId` 找；
+- `function_call` 与它的 `function_call_output` **同步改名**，配对完整性不受影响；
+- `RENDER_VERSION` 89 → 90（请求体形状确实变了，照例递增一次）。
+
+### 踩到的坑
+
+- **反向验证时"只修一半"才是有价值的那一半**：只把 id 改名、回执仍按原 `callId` 登记，
+  ①（无重复 id）和②（配对齐全）都会**绿**，只有③（各自配到自己那条回执）会红。
+  所以夹具里必须给每次调用**内容不同**的回执——真机上那两条回执逐字节相同，照抄真机的话
+  测不出错配。
+- 回执正文外面套着 `renderToolOutput` 的模板（工具名/状态/纪律三段），断言不能写等值，
+  要按"含"判。
+- "重复"这个判据要在 `function_call` **内部**数：一次调用天然贡献两条同 id 的 item
+  （call + output），把两类混起来数会把正常日志也判成重复。
+
+### 验证
+
+- `test/tool-call-id-unique.test.ts` 新增 7 条用例（清 7/7）；夹具照 turn 3426 的真实形状
+  （step 5/10 重复 + step 15/16/19 三次重复）。
+- 反向验证两次：退回 v89 行为（不加后缀）⇒ ①⑥ 红；只改名不改配对 ⇒ ③ 红。
+- 渲染相关四套（`render` / `reasoning-shape` / `protocol-bytes` / `tool-call-id-unique`）
+  178/178 通过；`tsc --noEmit` 干净。
+
+### 顺带做掉的（本轮同批）
+
+- **heavy 切到 yuki**：`gemini-auto @ 127.0.0.1:8000` 那个网关在本机**没有监听**（直连返回
+  000，走代理时那个 `502` 是代理自己的回包），xcm 备用也是 403 欠费。`models.heavy` 改成
+  `deepseek-v4.1-flash @ https://cli.yukira1n.com/v1`（与 light 同一条），启动日志已确认
+  `heavy=deepseek-v4.1-flash @ https://cli.yukira1n.com/v1`。
+- **运行实例读的是 `%LOCALAPPDATA%\Irmia\Agent\config.json`**，不是仓库 `config.json` ——
+  改模型路由必须改那一份（本轮先改了仓库那份，白改一次）。
+- GUI 已重启（新 pid），加载了含失败横幅的 `app.so`。
+
+### 未做
+
+- **`#N` 后缀只是让请求能发出去**：它不改写历史，所以日志里那两次重复调用仍然是两次
+  （她会看到自己"发了两遍同样的话"）。要不要在源头（`agent-loop` 收响应时）就重编 id，
+  是另一个决定——那会动到"日志即事实"这条边界，需要单独评估。
+- `model/degraded` 仍未接到界面（LINRE-001 剩下的那一半）。
