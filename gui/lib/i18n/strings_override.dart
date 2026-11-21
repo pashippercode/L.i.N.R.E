@@ -1285,6 +1285,9 @@ Map<String, String> stringsAsMap(AppStrings s) => <String, String>{
     // 更新检查（2026-10-22）
     'updateView': s.updateView,
     'updateDismiss': s.updateDismiss,
+    // 聊天页失败横幅（2026-11-22）
+    'turnFailedTitle': s.turnFailedTitle,
+    'turnFailedNoReason': s.turnFailedNoReason,
     'updateSectionTitle': s.updateSectionTitle,
     'updateSectionNote': s.updateSectionNote,
     'updateCheckNow': s.updateCheckNow,
@@ -1761,6 +1764,18 @@ class OverriddenStrings extends AppStrings {
   String get thinkingLabel => overrides['thinkingLabel'] ?? base.thinkingLabel;
   @override
   String get thinkingGap => overrides['thinkingGap'] ?? base.thinkingGap;
+  // 重试那一行**不开放覆盖**：它是带参数的量（第几次 / 等几秒），覆盖面一旦开到这里，
+  // 得为它再设计一套占位符语法；而它本身没有措辞余地，所以直接转发给 base。
+  @override
+  String retryLine(int attempt, String delay) => base.retryLine(attempt, delay);
+
+  @override
+  String get turnFailedTitle =>
+      overrides['turnFailedTitle'] ?? base.turnFailedTitle;
+
+  @override
+  String get turnFailedNoReason =>
+      overrides['turnFailedNoReason'] ?? base.turnFailedNoReason;
   @override
   String get toastContextCleared => overrides['toastContextCleared'] ?? base.toastContextCleared;
   @override

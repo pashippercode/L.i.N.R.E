@@ -953,6 +953,238 @@ void main() {
       expect(find.textContaining('[exit code: 0]'), findsWidgets, reason: '状态行照旧要看得见');
     });
   });
+
+  // ─────────── 重试进度：`model/retry-progress`（2026-11-22） ───────────
+  //
+  // 用户的原话是「她卡住了我得知道」。`DsClient` 的重试是静默的（退避是裸 `setTimeout`），
+  // 而 `retryCount` 只在调用结束之后才落进 `budget/consumed` ⇒ 重试期间界面只有「思考中…」
+  // 一行、最长几十秒不动，看起来就是卡死。后端补的那条事件带 `{turn, step, attempt, delayMs,
+  // kind, lane}`——**没有错误正文、没有服务端原话**，它只回答"在等第几次、等多久"。
+  //
+  // 这一组钉四件事：重试段出现且与四个读数**并存**、换步不许跟过来、成功之后撤掉、`turn/end` 收掉。
+  group('重试进度：卡在退避里也要看得出来', () {
+    testWidgets('重试事件一到，那一行多出「第 N 次重试 · 等 M 秒」，四个读数照旧在走', (tester) async {
+      final api = await bootChat(tester);
+      await api.emit('turn/start', <String, dynamic>{'turn': 21});
+      await api.emit('step/start', <String, dynamic>{'turn': 21, 'step': 1});
+      await api.emit('step/reasoning-progress', <String, dynamic>{'turn': 21, 'step': 1, 'chars': 800});
+      await _settle(tester);
+      expect(find.textContaining('800 字'), findsOneWidget);
+      expect(find.textContaining('重试'), findsNothing, reason: '还没重试过：一个字的提示都不该有');
+
+      // 第一发失败、准备退避 8 秒
+      await api.emit('model/retry-progress', <String, dynamic>{
+        'turn': 21, 'step': 1, 'attempt': 1, 'delayMs': 8000, 'kind': 'network', 'lane': 'heavy',
+      });
+      await _settle(tester);
+      expect(find.textContaining('第 1 次重试 · 等 8 秒'), findsOneWidget);
+      // 关键：她**仍在想**，四个读数一个都没被顶掉
+      expect(find.textContaining('思考中'), findsOneWidget);
+      expect(find.textContaining('800 字'), findsOneWidget);
+
+      // 第二次失败，退避拉长到 15 秒（那行跟着变，不是又加一行）
+      await api.emit('model/retry-progress', <String, dynamic>{
+        'turn': 21, 'step': 1, 'attempt': 2, 'delayMs': 15000, 'kind': 'server', 'lane': 'heavy',
+      });
+      await _settle(tester);
+      expect(find.textContaining('第 2 次重试 · 等 15 秒'), findsOneWidget);
+      expect(find.textContaining('第 1 次重试'), findsNothing);
+    });
+
+    testWidgets('换步之后上一步的重试不许跟过来', (tester) async {
+      final api = await bootChat(tester);
+      await api.emit('turn/start', <String, dynamic>{'turn': 22});
+      await api.emit('step/start', <String, dynamic>{'turn': 22, 'step': 1});
+      await api.emit('model/retry-progress', <String, dynamic>{
+        'turn': 22, 'step': 1, 'attempt': 3, 'delayMs': 4000, 'kind': 'server', 'lane': 'heavy',
+      });
+      await _settle(tester);
+      expect(find.textContaining('第 3 次重试'), findsOneWidget);
+
+      // 下一步：还没发过任何请求，不该挂着上一步的重试
+      await api.emit('step/start', <String, dynamic>{'turn': 22, 'step': 2});
+      await _settle(tester);
+      expect(find.textContaining('重试'), findsNothing, reason: '换步 = 清零');
+      expect(find.textContaining('思考中'), findsOneWidget);
+    });
+
+    testWidgets('这一发成功了 ⇒ 重试段立刻撤掉（那句话事后是错的）', (tester) async {
+      final api = await bootChat(tester);
+      await api.emit('turn/start', <String, dynamic>{'turn': 23});
+      await api.emit('step/start', <String, dynamic>{'turn': 23, 'step': 1});
+      await api.emit('model/retry-progress', <String, dynamic>{
+        'turn': 23, 'step': 1, 'attempt': 2, 'delayMs': 6000, 'kind': 'network', 'lane': 'heavy',
+      });
+      await _settle(tester);
+      expect(find.textContaining('第 2 次重试'), findsOneWidget);
+
+      await api.emit('message/assistant', <String, dynamic>{'turn': 23, 'step': 1, 'text': '好了'});
+      await _settle(tester);
+      expect(find.textContaining('重试'), findsNothing, reason: '成功了就不该再说"在等下一发"');
+    });
+
+    testWidgets('turn/end 照旧把整行收掉（重试中结束也一样）', (tester) async {
+      final api = await bootChat(tester);
+      await api.emit('turn/start', <String, dynamic>{'turn': 24});
+      await api.emit('step/start', <String, dynamic>{'turn': 24, 'step': 1});
+      await api.emit('model/retry-progress', <String, dynamic>{
+        'turn': 24, 'step': 1, 'attempt': 5, 'delayMs': 15000, 'kind': 'timeout', 'lane': 'heavy',
+      });
+      await _settle(tester);
+      expect(find.textContaining('第 5 次重试'), findsOneWidget);
+
+      await api.emit('turn/end', <String, dynamic>{
+        'turn': 24,
+        'reason': <String, dynamic>{'kind': 'error', 'message': '连续失败'},
+      });
+      await _settle(tester);
+      expect(find.textContaining('思考中'), findsNothing);
+      expect(find.textContaining('重试'), findsNothing);
+    });
+  });
+
+  // ─────────── 失败横幅：`turn/end{kind:'error'}`（2026-11-22） ───────────
+  //
+  // 用户 2026-11-21 报的是「跑过了但是没反应」。查清的实情是**她一直在失败**：那两小时
+  // 跑了 7 轮，每轮都是 `403 insufficient balance`，`turn/end` 到达后「思考中…」照常收掉，
+  // 于是界面表现和"她说完了但没开口"**一模一样**——一个字都不解释为什么。
+  //
+  // 这一组钉四件事：失败要露出原话、成功要把它撤掉、人自己掐的不许报成"坏了"、
+  // 旧轮次的补拉不许把已经清掉的那条顶回来。
+  group('失败横幅：她没能说完就得说清为什么', () {
+    testWidgets('turn/end{error} ⇒ 输入框上方出现横幅，原话与错误码都在', (tester) async {
+      final api = await bootChat(tester);
+      // 一开始没有横幅（页面上不该常驻一条"你没坏"的废话）
+      expect(find.byKey(const ValueKey('chat-turn-failure')), findsNothing);
+
+      await api.emit('turn/start', <String, dynamic>{'turn': 30});
+      await _settle(tester);
+      expect(find.textContaining('思考中'), findsOneWidget);
+
+      await api.emit('turn/end', <String, dynamic>{
+        'turn': 30,
+        'spoke': false,
+        'reason': <String, dynamic>{
+          'kind': 'error',
+          'code': 'http_403',
+          'message': '请求被拒绝（403）：重试同样的请求必然同样失败（服务端原话：insufficient balance）',
+        },
+      });
+      await _settle(tester);
+
+      // 「思考中」照旧收掉——但它**不再是唯一的反应**
+      expect(find.textContaining('思考中'), findsNothing);
+      expect(find.byKey(const ValueKey('chat-turn-failure')), findsOneWidget);
+      expect(find.text('她这一轮没能说完'), findsOneWidget);
+      expect(find.textContaining('insufficient balance'), findsOneWidget,
+          reason: '服务端那句原话必须原样带到人眼前——转述会把线索丢掉');
+      expect(find.text('http_403'), findsOneWidget, reason: '错误码要能一眼对上日志');
+    });
+
+    testWidgets('她下一次正常说话 ⇒ 横幅立刻撤掉（不能在她已经好了之后继续说坏了）', (tester) async {
+      final api = await bootChat(tester);
+      await api.emit('turn/end', <String, dynamic>{
+        'turn': 31,
+        'reason': <String, dynamic>{'kind': 'error', 'code': 'http_403', 'message': '余额不足'},
+      });
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('chat-turn-failure')), findsOneWidget);
+
+      await api.emit('message/assistant', <String, dynamic>{'turn': 32, 'step': 1, 'text': '我回来了'});
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('chat-turn-failure')), findsNothing);
+      expect(find.text('我回来了'), findsOneWidget);
+    });
+
+    testWidgets('turn/end{completed} ⇒ 也撤掉（她说了话，或者干净地判断这次不说）', (tester) async {
+      final api = await bootChat(tester);
+      await api.emit('turn/end', <String, dynamic>{
+        'turn': 33,
+        'reason': <String, dynamic>{'kind': 'error', 'code': 'timeout_silent', 'message': '静默超时'},
+      });
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('chat-turn-failure')), findsOneWidget);
+
+      await api.emit('turn/end', <String, dynamic>{
+        'turn': 34,
+        'spoke': false,
+        'reason': <String, dynamic>{'kind': 'completed'},
+      });
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('chat-turn-failure')), findsNothing,
+          reason: 'completed 是"这一轮正常结束"，不是"坏了"');
+    });
+
+    testWidgets('人自己掐的（aborted/stop）不许报成"她坏了"', (tester) async {
+      final api = await bootChat(tester);
+      await api.emit('turn/end', <String, dynamic>{
+        'turn': 35,
+        'reason': <String, dynamic>{'kind': 'aborted', 'cause': 'stop'},
+      });
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('chat-turn-failure')), findsNothing,
+          reason: '按了停止不是故障——报成故障会让人以为自己出了问题');
+
+      // 预算耗尽、限流、截断各有自己的出口（预算页 / 重试计数 / token 显示），
+      // 一律不在这条横幅里重复一遍。
+      for (final reason in <Map<String, dynamic>>[
+        <String, dynamic>{'kind': 'budget-exhausted', 'layer': 'turn'},
+        <String, dynamic>{'kind': 'rate-limited', 'retryAfterMs': 3000},
+        <String, dynamic>{'kind': 'max-tokens', 'outputTokens': 8000},
+        <String, dynamic>{'kind': 'blocked', 'by': 'guard'},
+        <String, dynamic>{'kind': 'interrupted'},
+      ]) {
+        await api.emit('turn/end', <String, dynamic>{'turn': 36, 'reason': reason});
+        await _settle(tester);
+        expect(find.byKey(const ValueKey('chat-turn-failure')), findsNothing,
+            reason: '${reason['kind']} 不该走失败横幅');
+      }
+    });
+
+    testWidgets('补拉来的旧轮次不许把新那条顶掉', (tester) async {
+      final api = await bootChat(tester);
+      await api.emit('turn/end', <String, dynamic>{
+        'turn': 40,
+        'reason': <String, dynamic>{'kind': 'error', 'code': 'http_500', 'message': '新的一条'},
+      });
+      await _settle(tester);
+      expect(find.textContaining('新的一条'), findsOneWidget);
+
+      // SSE 重连时服务端会从 `lastId + 1` 补发；断线窗口里那条更早的轮次可能后到
+      await api.emit('turn/end', <String, dynamic>{
+        'turn': 38,
+        'reason': <String, dynamic>{'kind': 'error', 'code': 'http_400', 'message': '旧的一条'},
+      });
+      await _settle(tester);
+      expect(find.textContaining('新的一条'), findsOneWidget, reason: '轮次单调：旧的不许反超');
+      expect(find.textContaining('旧的一条'), findsNothing);
+    });
+
+    testWidgets('横幅可以自己关掉（不改后端状态、不重试这一轮）', (tester) async {
+      final api = await bootChat(tester);
+      await api.emit('turn/end', <String, dynamic>{
+        'turn': 41,
+        'reason': <String, dynamic>{'kind': 'error', 'code': 'http_403', 'message': '余额不足'},
+      });
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('chat-turn-failure')), findsOneWidget);
+
+      await tester.tap(find.byKey(const ValueKey('chat-turn-failure-dismiss')));
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('chat-turn-failure')), findsNothing);
+    });
+
+    testWidgets('失败没有服务端原因时不许编一句（明说"没给原因"）', (tester) async {
+      final api = await bootChat(tester);
+      await api.emit('turn/end', <String, dynamic>{
+        'turn': 42,
+        'reason': <String, dynamic>{'kind': 'error', 'code': 'unknown', 'message': '  '},
+      });
+      await _settle(tester);
+      expect(find.byKey(const ValueKey('chat-turn-failure')), findsOneWidget);
+      expect(find.text('服务端没给原因'), findsOneWidget);
+    });
+  });
 }
 
 /// 给界面几拍把异步的东西落下来：**不用 `pumpAndSettle`**。

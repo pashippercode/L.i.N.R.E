@@ -386,6 +386,22 @@ class ChatPageState extends State<ChatPage> {
   /// 节流窗口到了之后补一次的那一拍（见 [_kThinkingThrottleMs]）
   Timer? _thinkingFlush;
 
+  /// 最近一次**这一轮没能说完**的原因（`turn/end{kind:'error'}` 的 `message`）；null = 没有。
+  ///
+  /// 为什么必须有这一格：`turn/end` 一到，前面那行「思考中…」就收掉了（见 [_trackThinking]），
+  /// 于是**失败看起来和"她说完了但没说话"一模一样**——2026-11-21 用户就是这么卡住的：
+  /// 两小时里跑了 7 轮，每轮都是 `403 insufficient balance`，而界面上从头到尾只有
+  /// 「思考中…」出现又消失，一个字都没说为什么。这不是"少一个提示"，是**把故障说成了常态**。
+  ///
+  /// 为什么是**一条常驻横幅**而不是往消息流里插卡片：历史里已经有 1469 条这种失败
+  /// （约每天 30 条），插卡会把真正的对话淹掉；而人真正需要看见的只是**"现在还坏着没有"**。
+  /// 所以只留最近一条，下一次成功（`message/assistant` 或 `turn/end{completed}`）就清掉。
+  ///
+  /// 哪些 `kind` 进这一格：只有 `error`。`aborted`/`interrupted`/`blocked`/`incomplete`/
+  /// `budget-exhausted`/`rate-limited`/`max-tokens` 都不进——它们要么是人自己掐的、要么
+  /// 已经另有出口（停止按钮/预算页/重试计数），把它们也报成"坏了"会说假话。
+  _TurnFailure? _turnFailure;
+
   /// 视图**此刻在不在最底部**（在 [_kAtBottomSlack] 的容差内）。
   ///
   /// 它是「跳到最新」那颗按钮要不要露出来的判据，也是"新内容该不该亮提示点"的一半。
@@ -920,6 +936,17 @@ class ChatPageState extends State<ChatPage> {
       case 'message/assistant':
         final text = (data['text']?.toString() ?? '').trim();
         if (text.isEmpty) return false;
+        // 这一发成功了 ⇒ 「现在还坏着没有」的答案是"没有"（见 [_TurnFailure]）：
+        // 横幅留着的话，会在她明明已经正常说话之后继续宣称她坏了。
+        if (_turnFailure != null) _turnFailure = null;
+        // 这一发成功了 ⇒ 重试段立刻撤掉（`model/retry-progress` 说的"在等下一发"已经不成立）。
+        // 不撤的话，成功的这一步会一直挂着「第 N 次重试」——那句话在事后是错的。
+        final pending = _pendingThinking;
+        if (pending != null && pending.retryAttempt != null) {
+          _pendingThinking = pending.copyWith(clearRetry: true);
+          // force：撤掉那一句是"这一发已经成功了"的直接后果，不该排在 250ms 窗口后面
+          _publishThinking(_pendingThinking, force: true);
+        }
         _sink.add(_BubbleItem.text(side: 'her', text: text, ts: ts));
         return true;
       case 'message/user':
@@ -1231,6 +1258,9 @@ class ChatPageState extends State<ChatPage> {
           step: step,
           chars: 0,
           phase: ThinkCharsPhase.pending,
+          // 换步 ⇒ 上一步的重试**一条都不许跟过来**：新的一步还没发过请求，
+          // 挂着上一步的「第 N 次重试」就是在说一件没发生的事。
+          clearRetry: true,
         );
         break;
       }
@@ -1277,11 +1307,30 @@ class ChatPageState extends State<ChatPage> {
         );
         break;
       }
-      case 'turn/end':
+      case 'turn/end': {
         // 这一轮结束：整行隐藏（不是显示"空闲"）。同步收掉待发的那一拍，
         // 否则它会在一轮结束之后再把这一行点亮 250ms
         _endThinking();
-        return;
+        // **失败必须说出来**：不然"她没能说完"与"她说完了但没开口"在界面上一模一样
+        // （见 [_TurnFailure] 的注释）。这里只认 `error` 那一档，其余几档各有各的出口。
+        final reason = (data['reason'] as Map?)?.cast<String, dynamic>();
+        final kind = reason?['kind']?.toString();
+        // 同一轮的重复 `turn/end`（SSE 重连补拉）不该把已经清掉的那条又立起来：
+        // 只有比手上这条更晚的轮次才作数。
+        final turn = _intOf(data['turn']) ?? 0;
+        if (kind == 'completed') {
+          // 她真的说完了 ⇒ 「现在还坏着没有」的答案是"没有"，横幅立刻该走。
+          if (_turnFailure != null) _turnFailure = null;
+        } else if (kind == 'error' && turn >= (_turnFailure?.turn ?? 0)) {
+          _turnFailure = _TurnFailure(
+            turn: turn,
+            message: (reason?['message']?.toString() ?? '').trim(),
+            code: (reason?['code']?.toString() ?? '').trim(),
+            ts: event['ts']?.toString(),
+          );
+        }
+        break;
+      }
       // 后端 (b) 的实时读数（`step/reasoning-progress`，2026-10-17）：推理正文**落库之前**
       // 那一段唯一能让「已想 X 字」是真的东西。载荷只有 `{turn, step, chars}`——**一个字的正文都没有**，
       // 所以这一格显示的是"到这一刻生成了多少字"，不是她想过的任何一句话。
@@ -1316,6 +1365,49 @@ class ChatPageState extends State<ChatPage> {
         _pendingThinking = current.copyWith(chars: chars, phase: ThinkCharsPhase.live);
         break;
       }
+      // 重试进度（`model/retry-progress`，2026-11-22）：重试期间那一行多出「第 N 次重试 · 等 M 秒」。
+      //
+      // 为什么需要：`DsClient` 的重试是静默的，成功之前不会有任何别的事件落地——没有这一条，
+      // 界面在整段退避期间只有「思考中…」一行，最长可以停几十秒不动，看起来就是卡死。
+      //
+      // 载荷里**没有错误正文、没有服务端原话**（只有 attempt / delayMs / kind）：这一行是
+      // 给"她卡住了我得知道"用的，不是错误展示面；真原因由失败收尾的 `turn/end` /
+      // `budget/consumed` 承担。
+      case 'model/retry-progress': {
+        final attempt = _intOf(data['attempt']) ?? 0;
+        if (attempt <= 0) return;
+        final delayMs = _intOf(data['delayMs']) ?? 0;
+        final step = _intOf(data['step']);
+        final current = _pendingThinking;
+        if (current == null) {
+          // 这一轮是**中途打开**的（或 SSE 重连只补到了后面这一段）：照 `step/reasoning-progress`
+          // 的先例由它自己把这一轮立起来——"她卡在重试里"恰恰是最该看见的时候。
+          _pendingThinking = ThinkingProgress(
+            turn: _intOf(data['turn']) ?? 0,
+            step: step ?? 0,
+            chars: 0,
+            since: clock.now(),
+            retryAttempt: attempt,
+            retryDelayMs: delayMs,
+          );
+          // **刷新出现时刻**：`reconcileThinking` 的宽限期从这个值起算，而重试恰恰是
+          // "她还在动"最硬的证据——不刷的话，服务端那一读（`thinking == false`）在宽限期
+          // 过了之后会把这一行误杀成"没在想"，而实际她正在第 N 次退避里。
+          _thinkingStartedAt = clock.now();
+          _publishThinking(_pendingThinking, force: true);
+          return;
+        }
+        // 步号单调：跨步的旧事件不许把重试挂到当前这一步上
+        if (step != null && step != current.step) return;
+        // 同一 attempt 的重复通知不重画（后端已去重，这里再挡一道：SSE 补拉会重放）
+        if (current.retryAttempt != null && attempt <= current.retryAttempt!) return;
+        _pendingThinking = current.copyWith(retryAttempt: attempt, retryDelayMs: delayMs);
+        // **绕过 250ms 节流直接上屏**：后端那条已经按 3 秒去重过（`RETRY_PROGRESS_MIN_INTERVAL_MS`），
+        // 再叠一层 250ms 的合并窗口毫无收益；而节流那条路靠 `Timer` 补发，重试恰好是最该
+        // 立刻可见的一件事——多等 250ms 没有意义，反而给了"这一拍被 cancel 掉"的机会。
+        _publishThinking(_pendingThinking, force: true);
+        return;
+      }
       default:
         return;
     }
@@ -1337,6 +1429,11 @@ class ChatPageState extends State<ChatPage> {
       return;
     }
     if (force) {
+      // 撤掉排在窗口末尾的那一拍：它到点时会用**当时的** `_pendingThinking` 覆盖一次，
+      // 而这次 force 写的已经是同一个对象（`_pendingThinking`）——那一拍不撤就是**多余的**
+      // 一次通知，且时机比这条即时更新还晚。撤掉它不丢任何东西。
+      _thinkingFlush?.cancel();
+      _thinkingFlush = null;
       _thinkingShownAtMs = clock.now().millisecondsSinceEpoch;
       thinkingNow.value = next;
       return;
@@ -1684,8 +1781,104 @@ class ChatPageState extends State<ChatPage> {
             ),
           ),
         ),
+        // 她这一轮没说完 ⇒ 输入框上方一条横幅（见 [_TurnFailure]）。
+        //
+        // 位置就在输入框**正上方**：那是人"刚按下发送、正等着回话"时眼睛落的地方，
+        // 也是「思考中…」刚刚收掉的那个位置——故障该出现在它消失的地方，而不是
+        // 让人回头往消息流里翻。高度随有无变化（这条是偶发事件，不像思考行那样
+        // 每分钟闪一次，插一行不会造成反复跳动）。
+        if (_turnFailure != null) _turnFailureBanner(scheme),
         _composer(scheme),
       ],
+    );
+  }
+
+  /// 这一轮没能说完的那条横幅（见 [_TurnFailure]）。
+  ///
+  /// 三件事必须同时做到，否则它就退化成一条没人看的灰字：
+  ///   · **说清是谁的问题**：标题写"她这一轮没能说完"，正文原样搬服务端那句话
+  ///     （`403 insufficient balance` 这种原话比任何转述都准，也是最容易被搜到的）；
+  ///   · **不撒谎**：服务端没给原因时明说"没给原因"，不自己编一句"网络异常"；
+  ///   · **可以自己消失**：她下一次正常开口就自动清掉（见 [_consume]），
+  ///     所以人不必手动关——但也可以关（那颗 × 只是把这一条收起来，不改任何状态）。
+  Widget _turnFailureBanner(ColorScheme scheme) {
+    final s = IrmiaStrings.of(context);
+    final failure = _turnFailure!;
+    final detail = failure.message.isEmpty ? s.turnFailedNoReason : failure.message;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(18, 0, 18, 10),
+      child: Container(
+        key: const ValueKey('chat-turn-failure'),
+        padding: const EdgeInsets.fromLTRB(12, 9, 8, 10),
+        decoration: BoxDecoration(
+          color: IrmiaTheme.danger.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(Shape.radiusControl),
+          border: Border.all(color: IrmiaTheme.danger.withValues(alpha: 0.35)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(top: 1),
+              child: Icon(Icons.error_outline_rounded, size: 15, color: IrmiaTheme.danger),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    s.turnFailedTitle,
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w600,
+                      color: IrmiaTheme.danger,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  // 原话可能很长（服务端会把整个响应体贴进来），只留两行；
+                  // 完整的那份始终在日志里，这里的目的只是让人**当场知道该去查什么**。
+                  Text(
+                    detail,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11.5,
+                      height: 1.45,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                  ),
+                  if (failure.code.isNotEmpty) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      failure.code,
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        fontFamily: 'monospace',
+                        color: scheme.onSurfaceVariant.withValues(alpha: 0.75),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            // 收起来：只清这一条（不改后端状态、不重试这一轮）。下一次失败会再出现。
+            SizedBox(
+              width: 26,
+              height: 22,
+              child: IconButton(
+                key: const ValueKey('chat-turn-failure-dismiss'),
+                padding: EdgeInsets.zero,
+                iconSize: 14,
+                tooltip: s.updateDismiss,
+                icon: Icon(Icons.close_rounded, color: scheme.onSurfaceVariant),
+                onPressed: () => setState(() => _turnFailure = null),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1794,6 +1987,32 @@ const double _kComposerFieldHeight = 52;
 /// 发送键的边长（40×40，圆角矩形）
 const double _kSendButtonSize = 40;
 
+/// 这一轮为什么没能说完（`turn/end{kind:'error'}`），只喂输入框上方那条横幅。
+///
+/// **它只代表"最近一次"**：下一次成功就清掉（见 [ChatPageState._consume]）。
+/// 不是账本、不做统计——账本在日志里（`turn/end` 一天 30 条，全搬上屏只会淹掉对话）。
+@immutable
+class _TurnFailure {
+  const _TurnFailure({
+    required this.turn,
+    required this.message,
+    required this.code,
+    this.ts,
+  });
+
+  /// 哪一轮（防 SSE 补拉时旧的那条把新的顶掉）
+  final int turn;
+
+  /// 服务端那句原话（`turn/end.reason.message`）。空串时界面退回只报 [code]。
+  final String message;
+
+  /// 稳定错误码（`http_403` / `timeout_silent` / …），界面上作为小字附在原因后面。
+  final String code;
+
+  /// 那一刻（RFC3339，服务端时钟）
+  final String? ts;
+}
+
 /// 她这一轮跑到哪儿了——喂「思考中 · 第 N 步 · 已想 X 字 · 用时 M:SS」那一行。
 ///
 /// 每个字段的出处见 [ChatPageState._trackThinking]。**不可变**：每次更新换一个新对象，
@@ -1806,6 +2025,8 @@ class ThinkingProgress {
     required this.chars,
     required this.since,
     this.phase = ThinkCharsPhase.pending,
+    this.retryAttempt,
+    this.retryDelayMs,
   });
 
   /// 第几轮（`turn/start` 的 `turn`）——只用来认"换了一轮没有"，不显示
@@ -1824,12 +2045,31 @@ class ThinkingProgress {
   /// 这个字数是"还没生成"还是"已经落库的真值"（见 [ThinkCharsPhase]）
   final ThinkCharsPhase phase;
 
-  ThinkingProgress copyWith({int? step, int? chars, ThinkCharsPhase? phase}) => ThinkingProgress(
+  /// 正在等第几次重试（`model/retry-progress` 的 `attempt`）；null = 此刻没在重试。
+  ///
+  /// 与 [phase] 正交：重试是"这一发失败了、在等下一发"，而 [phase] 说的是"推理正文的数字
+  /// 从哪来"。两者会同时成立（边重试边已经想了一些字），所以不做成枚举里的一档。
+  final int? retryAttempt;
+
+  /// 这一发要等多久（毫秒）；与 [retryAttempt] 同生同灭。
+  final int? retryDelayMs;
+
+  ThinkingProgress copyWith({
+    int? step,
+    int? chars,
+    ThinkCharsPhase? phase,
+    int? retryAttempt,
+    int? retryDelayMs,
+    bool clearRetry = false,
+  }) =>
+      ThinkingProgress(
         turn: turn,
         step: step ?? this.step,
         chars: chars ?? this.chars,
         since: since,
         phase: phase ?? this.phase,
+        retryAttempt: clearRetry ? null : (retryAttempt ?? this.retryAttempt),
+        retryDelayMs: clearRetry ? null : (retryDelayMs ?? this.retryDelayMs),
       );
 
   /// 已经想了多久（至少 0：本机时钟被人改过也不显示负数）。
@@ -1845,6 +2085,14 @@ class ThinkingProgress {
     return value.isNegative ? Duration.zero : value;
   }
 
+  /// ⚠ **`retryAttempt` / `retryDelayMs` 必须算进来**（2026-11-22 踩到的坑）。
+  ///
+  /// `ValueNotifier` 的 setter 在 `==` 为真时**既不赋值也不通知**。原先这里只比
+  /// `turn/step/chars/since/phase`——而重试事件到来的那一刻，前五个字段**一个都没变**
+  /// （还是同一步、同一批字数），于是新对象被判成"和旧的一样"，那行永远等不到
+  /// 「第 N 次重试」。表现极具误导性：`thinkingNow.value = next` 之后立刻读回，
+  /// 拿到的是**旧对象**（`identical(next, value) == false`、`retry == null`），
+  /// 看上去像赋值没生效。
   @override
   bool operator ==(Object other) =>
       other is ThinkingProgress &&
@@ -1852,10 +2100,12 @@ class ThinkingProgress {
       other.step == step &&
       other.chars == chars &&
       other.since == since &&
-      other.phase == phase;
+      other.phase == phase &&
+      other.retryAttempt == retryAttempt &&
+      other.retryDelayMs == retryDelayMs;
 
   @override
-  int get hashCode => Object.hash(turn, step, chars, since, phase);
+  int get hashCode => Object.hash(turn, step, chars, since, phase, retryAttempt, retryDelayMs);
 }
 
 /// 「已想 X 字」那一格**此刻说的是什么数**（用户 2026-10-16 ①）。
@@ -2108,12 +2358,26 @@ String thinkingLine(ThinkingProgress p, {AppStrings strings = const ZhStrings()}
       // 没数就说没数：`…` 是"还没生成"，不是 0
       : '   …';
   // 四个格子 + 语言各自的分隔符（中文全角空格、英文半角双空格），语序也在 strings 里
-  return [
+  final cells = <String>[
     strings.thinkingLabel,
     strings.thinkingStep(step),
     strings.thinkingChars(chars),
     strings.thinkingElapsed(formatThinkingElapsed(p.elapsed)),
-  ].join(strings.thinkingGap);
+  ];
+  // 重试段（`model/retry-progress`，2026-11-22）：**追加在最后一格**
+  //
+  // 为什么追加而不是替换「思考中」：重试期间她**仍在想**（那一次请求已经在路上、失败已发生、
+  // 正在等下一发），把它换成另一套动词会让人以为前一段工作是白做的。这一格只说清
+  // "她在等"，四个读数继续走。
+  //
+  // 为什么把秒数写进文字而不是留空：退避跨度从 0.8 秒到 15 秒有一万倍的差距，只说"重试中"
+  // 等于没说——"等 15 秒"才让人判断得出该不该继续等下去。
+  final attempt = p.retryAttempt;
+  if (attempt != null && attempt > 0) {
+    final seconds = ((p.retryDelayMs ?? 0) / 1000).ceil().clamp(1, 999);
+    cells.add(strings.retryLine(attempt, seconds.toString()));
+  }
+  return cells.join(strings.thinkingGap);
 }
 
 /// 进行中指示：**三个点依次淡入淡出**（用户 2026-10-16：「克制的进行中指示」）。

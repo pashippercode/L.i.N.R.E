@@ -827,6 +827,14 @@ abstract class AppStrings {
   /// 四个格子之间的分隔符
   String get thinkingGap;
 
+  /// 重试那一行：`第 N 次重试 · 等 M 秒`。
+  ///
+  /// 与 [thinkingLabel] 并存而不是替换它：重试期间她**仍在想**，只是这一个 attempt 已经失败、
+  /// 在等下一发。所以这一行是附加信息，不是另一套状态。
+  ///
+  /// `N` 是已失败次数（第 N 次失败之后开始退避），`M` 是这一发要等多久（秒，向上取整到 1 位）。
+  String retryLine(int attempt, String delay);
+
   /// 字数给人看的短写（中文按"万"分档、英文按"k"分档）
   String compactChars(int chars);
 
@@ -3657,6 +3665,12 @@ abstract class AppStrings {
   /// 关闭这条提示
   String get updateDismiss;
 
+  /// 聊天页横幅：这一轮她没能说完（后面接服务端那句原话）
+  String get turnFailedTitle;
+
+  /// 聊天页横幅：服务端没给原因时的兜底说明
+  String get turnFailedNoReason;
+
   /// 更新
   String get updateSectionTitle;
 
@@ -4282,6 +4296,8 @@ class ZhStrings extends AppStrings {
   String thinkingElapsed(String elapsed) => '用时 $elapsed';
   @override
   String get thinkingGap => '　';
+  @override
+  String retryLine(int attempt, String delay) => '第 $attempt 次重试 · 等 $delay 秒';
   @override
   String compactChars(int chars) {
     if (chars < 10000) return '$chars';
@@ -6638,6 +6654,10 @@ class ZhStrings extends AppStrings {
   @override
   String get updateDismiss => '关闭这条提示';
   @override
+  String get turnFailedTitle => '她这一轮没能说完';
+  @override
+  String get turnFailedNoReason => '服务端没给原因';
+  @override
   String get updateSectionTitle => '更新';
   @override
   String get updateSectionNote =>
@@ -7287,6 +7307,8 @@ class EnStrings extends AppStrings {
   String thinkingElapsed(String elapsed) => 'elapsed $elapsed';
   @override
   String get thinkingGap => '  ';
+  @override
+  String retryLine(int attempt, String delay) => 'retry $attempt · wait ${delay}s';
   @override
   String compactChars(int chars) {
     if (chars < 1000) return '$chars';
@@ -9732,6 +9754,10 @@ class EnStrings extends AppStrings {
   String get updateView => 'View';
   @override
   String get updateDismiss => 'Dismiss this notice';
+  @override
+  String get turnFailedTitle => 'She could not finish this turn';
+  @override
+  String get turnFailedNoReason => 'the server gave no reason';
   @override
   String get updateSectionTitle => 'Updates';
   @override
