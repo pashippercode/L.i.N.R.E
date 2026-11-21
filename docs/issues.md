@@ -243,3 +243,16 @@ turn/end { kind: 'error', code: 'http_400',
   （她会看到自己"发了两遍同样的话"）。要不要在源头（`agent-loop` 收响应时）就重编 id，
   是另一个决定——那会动到"日志即事实"这条边界，需要单独评估。
 - `model/degraded` 仍未接到界面（LINRE-001 剩下的那一半）。
+
+### 真机验收（2026-11-22 06:43，turn 3567）
+
+修复部署并重启后她自己跑完了一整轮，这是 11-19 以来第一次：
+
+```
+turn/start 3567 → read_channel → read_channel → speak（3 条 speak/sent）
+              → plugin__linre-ambient__peek_host → pwsh → speak（3 条 speak/sent）
+              → turn/end {"kind": "completed"}
+```
+
+对照：同一份历史在旧渲染器下渲染出 2 处重复 id（`call_1c1a797d…` ×2、`call_c595353a…` ×3），
+新渲染器 0 处、43 次调用配对齐全（378,586 条真实事件，脚本 `~/.config/alma/scratch/verify-dup.mjs`）。
