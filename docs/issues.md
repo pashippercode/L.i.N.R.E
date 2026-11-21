@@ -144,7 +144,18 @@ turn/end  {"kind":"error","code":"http_403",
 - 整套 GUI：945 pass / 14 fail，与 stash 基线逐条比对后**新增 0 条**（11 条基线失败全是旧的：`advice_act` 5、`copy_coverage` 2、`auth_gate` 1、`instance_picker` 1、`widget_test` 1、`strings_override` 1）。
 - `dart analyze` 三个改动文件 0 issue。
 
+### 部署
+
+`build-gui.yml` run 44953482214 成功（`windows-2022` / Flutter 3.35.4）。产物已装：
+
+- `%LOCALAPPDATA%\Irmia\Agent\gui\data\app.so` 换成新构建（Dart AOT 里按 UTF-16-LE 搜得到「她这一轮没能说完」，旧那份搜不到）；
+- `irmia_gui.exe` 与几个 plugin dll 与旧构建同版本、且被运行中的进程占用，未替换（不替换也不影响：改动全在 `app.so`）；
+- 备份在 `~/.config/alma/scratch/gui-bak-20261122/`。
+
+**尚未生效**：GUI 进程（pid 2944）还在跑旧的那份 `app.so`，重启才加载新内容。
+
 ### 未做
 
-- **真机验证**：GUI 二进制还是 11-16 的，得推 `gui/**` 走 `build-gui.yml`（`windows-2022`，Flutter 3.35.4）出包，下载后覆盖 `%LOCALAPPDATA%\Irmia\Agent\gui`（保留旧 VC 运行库 dll）。
+- **真机验证**：重启 GUI 之后才能看到横幅本身。
 - **`model/degraded` 仍未接到界面**（LINRE-001 剩下的那一半），改道那一刻还是只有终端日志。
+- **本机 heavy 路由不可用**（另一个问题，不属于本条）：`models.heavy` = `gemini-auto @ http://127.0.0.1:8000/v1`，而 8000 上没有任何监听（绕开 `HTTP_PROXY=127.0.0.1:7890` 直连返回 000）。注意 `curl` 走代理时会拿到一个假的 `502 Bad Gateway`，别拿它当"端点活着但上游挂了"的证据。degenerated 走 `xcmapi.org` 也是 403 insufficient balance（欠费）。当前只有 `light`（yuki）能出话。
