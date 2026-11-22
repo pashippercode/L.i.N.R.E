@@ -1,0 +1,48 @@
+#AOCI-CODE-VOLUME: 1
+
+===/<repository>/===
+.gitignore[FV4T]: F:Keeps machine-local runtime state out of Git: config overrides, data directory, build output, and scratch artifacts | R:- | A:- | S:config.json is ignored on purpose because it holds the live model routes, so the tracked example file is the only source of truth for defaults
+
+===/<repository>/src/model/===
+compaction-warning.ts[RM6M]: F:Decides when a compaction warning fires and composes its wording for the 80 and 95 percent tiers | R:code:src/runtime/real-loop.ts | A:- | S:Each tier reports at most once per compaction cycle with no clock in the criterion, so a tier already reported never repeats however long the cycle runs
+context-audit.ts[RN7L]: F:Records the per-request context attribution as segment facts and reports a cache-break sentinel when the shared prefix of two consecutive requests diverges | R:code:src/model/render.ts | A:- | S:Both outputs ride on the existing budget event rather than a new event type; the render layer owns segment boundaries, this module only compares and words them
+cost-segments.ts[RM6M]: F:Read-only aggregation of the per-request context segment facts into per-segment totals, averages, shares, and the latest breakdown | R:code:src/model/context-audit.ts | A:- | S:Recomputes nothing; every segment token figure is taken from what the render layer already recorded
+ds-client.ts[RN8L]: F:Model transport client for both protocols: builds requests, retries with backoff, classifies transport errors, and holds the degraded-route failover state | R:code:src/config/config.ts | A:- | S:Stream failure is settled after pump, not on response headers: a 2xx stream with no content now counts toward failover instead of resetting it
+probe.ts[RM7M]: F:Implements the model probe behind the onboarding probe button: lists endpoint models, tests both protocols in parallel, recommends one | R:code:src/model/ds-client.ts | A:- | S:Read-only apart from one tiny paid request per protocol; one 12 second deadline covers the whole probe and the key never reaches a returned string
+reject-record.ts[RM6M]: F:Builds the 400 flight recorder event: which request was rejected, its size and history shape, and a redacted preview of the tail after the last user turn | R:code:src/model/render.ts | A:- | S:Reads only the already built input and never changes a request byte; previews are truncated and carry no image data, tokens, or absolute paths
+render.ts[RG9L]: F:Assembles every model request from the event log: layered instructions, per-segment context, tool schemas, reasoning echo, and dedupe of repeated tool call ids | R:code:src/model/ds-client.ts | A:- | S:A call id the model repeats inside one turn gets a deterministic #N suffix on its second and later occurrence, so no request carries a duplicate; the first keeps its original id
+self-brief.ts[RN6M]: F:Holds the static self brief that opens the instructions prefix and renders the current contact note from live config and wake source | R:code:src/model/render.ts | A:- | S:The static brief may carry no run-varying word at all because it is the largest shared prefix and any edit costs a full cache miss; contact note belongs to state, not to the brief
+self-organize-reminder.ts[RM5T]: F:Plans the self-organise reminder that fires after two consecutive idle beats, again after three more, then never in that quiet period | R:code:src/runtime/real-loop.ts | A:- | S:The state machine is re-armed only by a real input; without that rule a long quiet night turned one reminder into one every two beats
+
+===/<repository>/src/model/transport/===
+chat-completions.ts[RN9L]: F:The Chat Completions transport: request body, sse parsing, finish-reason mapping, and a lossy json_schema to json_object downgrade | R:code:src/model/transport/types.ts | A:- | S:Deliberately sends no reasoning echo, no user or user_id, no stream_options, tool_choice, or penalty fields, and no empty tools array, because each of those risks a 400 on some endpoints
+registry.ts[RM8M]: F:Caches the per-endpoint protocol decision and runs the state machine that answers whether an endpoint speaks Responses or Chat Completions | R:code:src/model/transport/types.ts | A:- | S:An endpoint is probed once per process and never re-probed after switching; eight counter-evidence classes never trigger a switch and never write a record
+responses.ts[RN9L]: F:The Responses protocol implementation: request body in fixed key order, response and SSE parsing, and usage extraction | R:code:src/model/transport/types.ts | A:- | S:A verbatim copy of the former ds-client code; key insertion order is the wire bytes, so no key may be moved. The only non-verbatim change is the accumulator interface living in types.ts, and no evaluation-time reference to ds-client may be written here because the module dependency is already circular
+sse.ts[RL7T]: F:SSE framing shared by both protocols: splits frames on blank lines, tolerates line endings split across chunks, and flushes the trailing frame | R:code:src/model/transport/types.ts | A:- | S:-
+types.ts[RN8M]: F:The transport contract a protocol implementation must satisfy: request building, sending, response and stream parsing, plus the error classifier hook | R:code:src/model/ds-client.ts | A:- | S:A transport must not decide retry, timeout, accounting, or error classification; those stay in DsClient so both protocols share one budget
+
+===/<repository>/src/===
+main.ts[RG9L]: F:Process entry that assembles every runtime dependency: config, key resolution, the DsClient, registries, channels, and the loop: the boot sequence itself | R:code:src/config/config.ts | A:- | S:Model lanes are read once at startup because models are restart-level, and the degraded route exists only when its own key resolves rather than borrowing another lane key
+
+===/<repository>/src/runtime/===
+agent-loop.ts[RG9L]: F:The turn and step loop: renders a request, streams the reply, dispatches tool calls, reports retry progress, retries zero-byte failures, and ends the turn | R:code:src/model/render.ts | A:toDsRequest | S:Heavy calls stream with an explicit model from the render layer, so failover switches the endpoint but never the model name; retry progress reports at most once per three seconds, deduped by attempt
+
+===/<repository>/docs/===
+aoci-setup.md[SG5S]: F:How to wire AOCI into this repository: why the MCP config carries no machine path, how to put aoci on PATH, and which commands read and maintain the index | R:- | A:- | S:The agent configs are committed on purpose: an init-generated config hardcodes this machine absolute repo path and is ignored by git, so it only works on the machine that ran init
+issues.md[ZG4M]: F:Local issue tracker: each entry records symptom, trigger, fix plan, verification, deployment, and status for problems with no GitHub issue | R:- | A:- | S:Four entries so far, including the ThinkingProgress equality bug where a ValueNotifier setter skips assignment, and a repeated tool call id that made every later turn get a 400
+
+===/<repository>/test/===
+retry-progress.test.ts[TM6S]: F:Pins the retry-progress event end to end: one event per retry, a payload with no error prose, throttling by attempt and interval, and internal visibility | R:code:src/runtime/agent-loop.ts | A:- | S:The fake model advances the clock before firing each retry callback; firing first collapses every hop into one millisecond and the throttle window swallows them
+
+===/<repository>/src/log/===
+types.ts[RG9L]: F:All log event types and the visibility table: the AppEvent union, payload shapes, and what reaches her context | R:- | A:AppEvent | S:model/retry-progress is internal on purpose: it feeds only the chat status line, never her request body; a new event must be registered here or the fold drops it
+
+===/<repository>/gui/lib/pages/===
+chat_page.dart[RG8L]: F:The chat screen: renders bubbles, tool rows and notices, drives the thinking status line, and shows a turn failure banner above the composer | R:code:gui/lib/api.dart | A:- | S:A failed turn is reported only for kind error, cleared by a completed turn or a new assistant message, and turn-monotonic so replay of an older turn never overwrites a newer failure
+
+===/<repository>/gui/lib/i18n/===
+app_strings.dart[SL6L]: F:Defines the user-facing string contract as an abstract class, with one Chinese and one English implementation covering every visible label | R:code:gui/lib/i18n/strings_override.dart | A:- | S:Adding a getter here breaks the overridable subclass until every translation and the hand-written stringsAsMap key table are updated too
+strings_override.dart[SL6L]: F:Applies user-supplied wording over the base strings, and carries the hand-written key table that decides which strings may be overridden | R:code:gui/lib/i18n/app_strings.dart | A:- | S:The key table is written by hand, so a new AppStrings getter needs its key added there or the ratchet test fails
+
+===/<repository>/gui/test/===
+chat_progress_test.dart[TM7L]: F:Pins the chat screen status behaviour: thinking row, retry progress line, and the turn failure banner across its clear and dismiss paths | R:code:gui/lib/pages/chat_page.dart | A:- | S:The retry cases only work because the fake clock is advanced before each callback; otherwise every hop collapses into one millisecond and the throttle swallows them
